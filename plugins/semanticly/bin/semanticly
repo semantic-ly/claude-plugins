@@ -2,10 +2,15 @@
 """:"
 # A shell runs these lines and hands the file to the first Python 3.9 or later
 # on PATH. Windows often has `python` or `py` and no `python3`. Python reads
-# the same lines as the start of this docstring.
+# the same lines as the start of this docstring. The `py` launcher would act
+# on this file's `#!/bin/sh` line, so it is asked for its interpreter's path.
 for candidate in python3 python py; do
-  if command -v "$candidate" >/dev/null 2>&1 &&
-     "$candidate" -c 'import sys; raise SystemExit(sys.version_info < (3, 9))' >/dev/null 2>&1; then
+  command -v "$candidate" >/dev/null 2>&1 || continue
+  if [ "$candidate" = py ]; then
+    candidate="$(py -3 -c 'import sys; print(sys.executable)' 2>/dev/null | tr -d '\r')"
+    [ -n "$candidate" ] || continue
+  fi
+  if "$candidate" -c 'import sys; raise SystemExit(sys.version_info < (3, 9))' >/dev/null 2>&1; then
     exec "$candidate" "$0" "$@"
   fi
 done
@@ -2745,19 +2750,23 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def use_utf8_streams() -> None:
-    """Read and write UTF-8 on Windows, whose pipes default to a legacy code page.
+    """Read and write UTF-8 with bare newlines on Windows.
 
-    A fact or a prompt outside that code page would otherwise fail to print
-    or arrive garbled. A stream that cannot be reconfigured is left as it is.
+    Its pipes default to a legacy code page, so a fact or a prompt outside
+    that page would fail to print or arrive garbled. Its text streams also
+    end each line with a carriage return, which a hook's shell would keep as
+    part of the value it reads. A stream that cannot be reconfigured is left
+    as it is.
     """
 
     if sys.platform != "win32":
         return
-    for stream, errors in ((sys.stdin, "strict"), (sys.stdout, "replace"),
-                           (sys.stderr, "replace")):
+    for stream, options in ((sys.stdin, {"errors": "strict"}),
+                            (sys.stdout, {"errors": "replace", "newline": "\n"}),
+                            (sys.stderr, {"errors": "replace", "newline": "\n"})):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is not None:
-            reconfigure(encoding="utf-8", errors=errors)
+            reconfigure(encoding="utf-8", **options)
 
 
 def main(argv: list[str] | None = None) -> int:

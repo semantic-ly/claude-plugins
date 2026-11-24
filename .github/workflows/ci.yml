@@ -78,15 +78,17 @@ jobs:
   floor:
     name: Python 3.9 floor
     runs-on: ubuntu-latest
+    # The runner image no longer offers Python 3.9, so the job runs in the
+    # official image for it.
+    container: python:3.9
     timeout-minutes: 5
     env:
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.9"
+      - name: Show the Python version
+        run: python3 --version
 
       - name: Compile the CLI and the hooks
         run: |
@@ -100,7 +102,9 @@ jobs:
           PY
 
       - name: Run the CLI
-        run: python3 plugins/semanticly/bin/semanticly --help
+        run: |
+          python3 plugins/semanticly/bin/semanticly --help
+          plugins/semanticly/bin/semanticly --help
 
   build:
     name: Build release assets

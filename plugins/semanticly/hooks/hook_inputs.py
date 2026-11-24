@@ -32,6 +32,13 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 
+# Windows ends each printed line with a carriage return, which the hook's
+# shell would keep as part of the field. Every hook script imports this
+# module, so the rule is set once here.
+if sys.platform == "win32":
+    for _stream in (sys.stdout, sys.stderr):
+        _stream.reconfigure(newline="\n")
+
 CLI_PATH = Path(__file__).resolve().parents[1] / "bin" / "semanticly"
 
 # The hooks read this code. Any other failure is a crash.

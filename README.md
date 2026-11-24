@@ -79,6 +79,8 @@ The steps are the same, with three differences.
 
 - Skip `chmod`. In PowerShell or Command Prompt, run the CLI through Python,
   as `python semanticly login` and `python semanticly init --repo <org>/<repo>`.
+  With the `py` launcher, write `py -3 semanticly login`. A bare `py semanticly`
+  fails.
 - Run `init` in PowerShell, Command Prompt or Windows Terminal. In the Git
   Bash window `init` cannot tell that it has a terminal, so it only lists the
   repositories and binds nothing.

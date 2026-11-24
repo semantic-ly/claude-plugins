@@ -89,8 +89,10 @@ class Cli(SmokeTestCase):
         self.assertIn("usage: semanticly", done.stdout)
 
     @unittest.skipUnless(WINDOWS and shutil.which("py"), "the `py` launcher is Windows only")
-    def test_the_py_launcher_runs_the_cli(self):
-        done = self.run_command(["py", str(CLI_PATH), "--help"])
+    def test_the_py_launcher_runs_the_cli_when_told_its_version(self):
+        """A bare `py <file>` acts on the file's `#!/bin/sh` line. `py -3` does not."""
+
+        done = self.run_command(["py", "-3", str(CLI_PATH), "--help"])
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("usage: semanticly", done.stdout)
 
@@ -130,6 +132,22 @@ class Hooks(SmokeTestCase):
                 self.assertNotIn("Traceback", done.stderr)
                 self.assertNotIn("no Python", done.stderr)
                 self.assertNotIn("no runnable CLI", done.stderr)
+
+    def test_no_hook_reader_prints_a_carriage_return(self):
+        """Windows text streams add one per line, and the hook's shell would keep it."""
+
+        for script, argv in (("hook_inputs.py", ["session-start"]), ("prompt_inputs.py", [""])):
+            with self.subTest(script=script):
+                done = subprocess.run(
+                    [sys.executable, str(PLUGIN / "hooks" / script), *argv],
+                    input=self.PAYLOAD.encode("utf-8"), capture_output=True, timeout=120,
+                    env=self.env, cwd=str(self.project))
+                self.assertNotIn(b"\r", done.stdout + done.stderr)
+
+        done = subprocess.run([sys.executable, str(CLI_PATH), "recall", "refunds"],
+                              capture_output=True, timeout=120, env=self.env,
+                              cwd=str(self.project))
+        self.assertNotIn(b"\r", done.stdout + done.stderr)
 
     def test_session_start_reminds_an_unbound_project_to_bind(self):
         done = self.run_hook("session-start.sh")
