@@ -1,0 +1,460 @@
+{
+  "_comment": "The ingest slice contract: the raw Claude Code transcript a PreCompact or SessionEnd hook reads, the wire slice it posts to the MCP `ingest` tool, and the flattened slice the server hands extraction. tests/plugin/test_ingest_hook.py writes `transcript` out as JSON Lines, runs the real hooks/ingest.sh and asserts the posted `slice` argument equals `wire`. tests/cli/test_ingest.py asserts the CLI's slicer turns `transcript` into `wire`. The server's tests read `wire`, `wire_refusals` and `slice` from their own copy of this file, so a change here needs the same change there.",
+  "_slice_comment": "Exactly three keys per line: uuid, role and content. `cwd` is a local filesystem path that can carry a username or a project name off the machine, and `sessionId`, `parentUuid` and `version` are machine-local metadata, so none of them is sent. `content` is flattened to a string: text blocks joined, `tool_use` and `tool_result` blocks dropped, because tool results are file contents, environment dumps and command output, which is where secrets live.",
+  "_uuid_comment": "The uuids are the transcript's own. The server cites one per extracted fact and deduplicates on it, so a slice without uuids cannot deduplicate. Changing a uuid or a body here changes a dedupe key on the server.",
+  "_transcript_comment": "One Claude Code transcript record per entry, carrying the fields the real file carries. The rows exercise every narrowing the hook owes: `cwd`/`sessionId`/`parentUuid`/`version` are present and must not survive; content arrives both as a bare string and as a block array; an assistant row pairs text with a `thinking` block and a `tool_use` block and only the text survives; a `type: user` row whose whole content is a `tool_result` block leaves no message; and a row with no `uuid` leaves no message, because a candidate drawn from it could cite nothing. Those last two rows are why `wire` is shorter than `transcript`.",
+  "slice": [
+    {
+      "uuid": "c41d7b90-3a62-4f18-9d05-7e2b6a0c8f31",
+      "role": "user",
+      "content": "Before we touch the retrieval handler, remind me what a recall actually reads today."
+    },
+    {
+      "uuid": "6f1c0b2e-9d47-4a83-b5e0-2c8fa1d94b67",
+      "role": "assistant",
+      "content": "Retrieval reads the main branch plus the caller's own branch, and rows drawn from the caller's own branch come back marked unreviewed. That is settled — it is what recall does now, not a proposal."
+    },
+    {
+      "uuid": "b3d81a05-7e2c-4f96-8a1b-0d4e6c93f218",
+      "role": "user",
+      "content": "Right. And we decided agents write only to their own branch at agents/<client-id>/<user> — an agent never opens a proposal itself any more. Treat that as the rule from here on."
+    },
+    {
+      "uuid": "9c60f4d8-1b73-4a25-8e19-5d3c7f2a0b64",
+      "role": "assistant",
+      "content": "Understood. Let me read the promotion service before I say anything about how the branch gets promoted."
+    },
+    {
+      "uuid": "0a7e5c31-4b8d-42f7-9e63-1c5a8b7d0e42",
+      "role": "user",
+      "content": "One more thing to write down: a repository under automatic promotion holds at most one open proposal per branch, and a scheduled sweep rolls newly written facts into it. Don't open a second one."
+    },
+    {
+      "uuid": "e8b30a76-5f91-4c2d-a047-9b6e1d3f8c25",
+      "role": "assistant",
+      "content": "Noted. I will keep the roll-into-the-existing-proposal shape and leave the scheduler to open at most one."
+    }
+  ],
+  "transcript": [
+    {
+      "parentUuid": null,
+      "sessionId": "01hzx4a7k9m2n5p8q1r4s7t0",
+      "type": "user",
+      "uuid": "c41d7b90-3a62-4f18-9d05-7e2b6a0c8f31",
+      "timestamp": "2026-09-09T14:02:11.418Z",
+      "cwd": "/Users/someone/project",
+      "version": "2.0.31",
+      "message": {
+        "role": "user",
+        "content": "  Before we touch the retrieval handler, remind me what a recall actually reads today.\n"
+      }
+    },
+    {
+      "parentUuid": "c41d7b90-3a62-4f18-9d05-7e2b6a0c8f31",
+      "sessionId": "01hzx4a7k9m2n5p8q1r4s7t0",
+      "type": "assistant",
+      "uuid": "6f1c0b2e-9d47-4a83-b5e0-2c8fa1d94b67",
+      "timestamp": "2026-09-09T14:02:19.802Z",
+      "cwd": "/Users/someone/project",
+      "version": "2.0.31",
+      "message": {
+        "role": "assistant",
+        "model": "claude-opus-4-5",
+        "content": [
+          {
+            "type": "text",
+            "text": "Retrieval reads the main branch plus the caller's own branch, and rows drawn from the caller's own branch come back marked unreviewed. That is settled — it is what recall does now, not a proposal."
+          }
+        ]
+      }
+    },
+    {
+      "parentUuid": "6f1c0b2e-9d47-4a83-b5e0-2c8fa1d94b67",
+      "sessionId": "01hzx4a7k9m2n5p8q1r4s7t0",
+      "type": "user",
+      "uuid": "b3d81a05-7e2c-4f96-8a1b-0d4e6c93f218",
+      "timestamp": "2026-09-09T14:03:47.155Z",
+      "cwd": "/Users/someone/project",
+      "version": "2.0.31",
+      "message": {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Right. And we decided agents write only to their own branch at agents/<client-id>/<user> — an agent never opens a proposal itself any more. Treat that as the rule from here on."
+          },
+          {
+            "type": "text",
+            "text": ""
+          }
+        ]
+      }
+    },
+    {
+      "parentUuid": "b3d81a05-7e2c-4f96-8a1b-0d4e6c93f218",
+      "sessionId": "01hzx4a7k9m2n5p8q1r4s7t0",
+      "type": "assistant",
+      "uuid": "9c60f4d8-1b73-4a25-8e19-5d3c7f2a0b64",
+      "timestamp": "2026-09-09T14:03:55.601Z",
+      "cwd": "/Users/someone/project",
+      "version": "2.0.31",
+      "message": {
+        "role": "assistant",
+        "model": "claude-opus-4-5",
+        "content": [
+          {
+            "type": "thinking",
+            "thinking": "The promotion service decides this, so read it first.",
+            "signature": "c2lnbmF0dXJl"
+          },
+          {
+            "type": "text",
+            "text": "Understood. Let me read the promotion service before I say anything about how the branch gets promoted."
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_01Qw8Rt5Yh2Kd9Pn3Vb6Lm4Z",
+            "name": "Read",
+            "input": {
+              "file_path": "/app/services/promotion.py"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "parentUuid": "9c60f4d8-1b73-4a25-8e19-5d3c7f2a0b64",
+      "sessionId": "01hzx4a7k9m2n5p8q1r4s7t0",
+      "type": "user",
+      "uuid": "7a2e9f31-6c04-48bd-b3f7-0e8d51c9a2b6",
+      "timestamp": "2026-09-09T14:03:56.037Z",
+      "cwd": "/Users/someone/project",
+      "version": "2.0.31",
+      "message": {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "toolu_01Qw8Rt5Yh2Kd9Pn3Vb6Lm4Z",
+            "content": "def decide(proposal): ...  # 340 lines elided"
+          }
+        ]
+      }
+    },
+    {
+      "parentUuid": "7a2e9f31-6c04-48bd-b3f7-0e8d51c9a2b6",
+      "sessionId": "01hzx4a7k9m2n5p8q1r4s7t0",
+      "type": "user",
+      "timestamp": "2026-09-09T14:04:40.007Z",
+      "cwd": "/Users/someone/project",
+      "version": "2.0.31",
+      "message": {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "A message the transcript wrote without a uuid, which no candidate could cite."
+          }
+        ]
+      }
+    },
+    {
+      "parentUuid": "7a2e9f31-6c04-48bd-b3f7-0e8d51c9a2b6",
+      "sessionId": "01hzx4a7k9m2n5p8q1r4s7t0",
+      "type": "user",
+      "uuid": "0a7e5c31-4b8d-42f7-9e63-1c5a8b7d0e42",
+      "timestamp": "2026-09-09T14:05:12.774Z",
+      "cwd": "/Users/someone/project",
+      "version": "2.0.31",
+      "message": {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": " \n"
+          },
+          {
+            "type": "text",
+            "text": "One more thing to write down: a repository under automatic promotion holds at most one open proposal per branch, and a scheduled sweep rolls newly written facts into it. Don't open a second one."
+          }
+        ]
+      }
+    },
+    {
+      "parentUuid": "0a7e5c31-4b8d-42f7-9e63-1c5a8b7d0e42",
+      "sessionId": "01hzx4a7k9m2n5p8q1r4s7t0",
+      "type": "assistant",
+      "uuid": "e8b30a76-5f91-4c2d-a047-9b6e1d3f8c25",
+      "timestamp": "2026-09-09T14:05:21.309Z",
+      "cwd": "/Users/someone/project",
+      "version": "2.0.31",
+      "message": {
+        "role": "assistant",
+        "model": "claude-opus-4-5",
+        "content": [
+          {
+            "type": "text",
+            "text": "Noted. I will keep the roll-into-the-existing-proposal shape and leave the scheduler to open at most one."
+          }
+        ]
+      }
+    }
+  ],
+  "wire": [
+    {
+      "uuid": "c41d7b90-3a62-4f18-9d05-7e2b6a0c8f31",
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "  Before we touch the retrieval handler, remind me what a recall actually reads today.\n"
+        }
+      ]
+    },
+    {
+      "uuid": "6f1c0b2e-9d47-4a83-b5e0-2c8fa1d94b67",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "Retrieval reads the main branch plus the caller's own branch, and rows drawn from the caller's own branch come back marked unreviewed. That is settled — it is what recall does now, not a proposal."
+        }
+      ]
+    },
+    {
+      "uuid": "b3d81a05-7e2c-4f96-8a1b-0d4e6c93f218",
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Right. And we decided agents write only to their own branch at agents/<client-id>/<user> — an agent never opens a proposal itself any more. Treat that as the rule from here on."
+        },
+        {
+          "type": "text",
+          "text": ""
+        }
+      ]
+    },
+    {
+      "uuid": "9c60f4d8-1b73-4a25-8e19-5d3c7f2a0b64",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "Understood. Let me read the promotion service before I say anything about how the branch gets promoted."
+        }
+      ]
+    },
+    {
+      "uuid": "0a7e5c31-4b8d-42f7-9e63-1c5a8b7d0e42",
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": " \n"
+        },
+        {
+          "type": "text",
+          "text": "One more thing to write down: a repository under automatic promotion holds at most one open proposal per branch, and a scheduled sweep rolls newly written facts into it. Don't open a second one."
+        }
+      ]
+    },
+    {
+      "uuid": "e8b30a76-5f91-4c2d-a047-9b6e1d3f8c25",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "Noted. I will keep the roll-into-the-existing-proposal shape and leave the scheduler to open at most one."
+        }
+      ]
+    }
+  ],
+  "wire_refusals": [
+    {
+      "name": "tool_use_block",
+      "wire": [
+        {
+          "uuid": "c41d7b90-3a62-4f18-9d05-7e2b6a0c8f31",
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "hi"
+            },
+            {
+              "type": "tool_use",
+              "id": "toolu_1",
+              "name": "Read",
+              "input": {}
+            }
+          ]
+        }
+      ],
+      "code": "non_text_block",
+      "uuid": "c41d7b90-3a62-4f18-9d05-7e2b6a0c8f31"
+    },
+    {
+      "name": "tool_result_block",
+      "wire": [
+        {
+          "uuid": "c41d7b90-3a62-4f18-9d05-7e2b6a0c8f31",
+          "role": "user",
+          "content": [
+            {
+              "type": "tool_result",
+              "tool_use_id": "toolu_1",
+              "content": "x"
+            }
+          ]
+        }
+      ],
+      "code": "non_text_block",
+      "uuid": "c41d7b90-3a62-4f18-9d05-7e2b6a0c8f31"
+    },
+    {
+      "name": "image_block",
+      "wire": [
+        {
+          "uuid": "c41d7b90-3a62-4f18-9d05-7e2b6a0c8f31",
+          "role": "user",
+          "content": [
+            {
+              "type": "image",
+              "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "AA=="
+              }
+            }
+          ]
+        }
+      ],
+      "code": "non_text_block",
+      "uuid": "c41d7b90-3a62-4f18-9d05-7e2b6a0c8f31"
+    },
+    {
+      "name": "string_content",
+      "wire": [
+        {
+          "uuid": "c41d7b90-3a62-4f18-9d05-7e2b6a0c8f31",
+          "role": "user",
+          "content": "plain string"
+        }
+      ],
+      "code": "bad_slice",
+      "uuid": ""
+    },
+    {
+      "name": "missing_uuid",
+      "wire": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "hello"
+            }
+          ]
+        }
+      ],
+      "code": "bad_slice",
+      "uuid": ""
+    },
+    {
+      "name": "uuid_over_64",
+      "wire": [
+        {
+          "uuid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "hello"
+            }
+          ]
+        }
+      ],
+      "code": "bad_slice",
+      "uuid": ""
+    },
+    {
+      "name": "system_role",
+      "wire": [
+        {
+          "uuid": "c41d7b90-3a62-4f18-9d05-7e2b6a0c8f31",
+          "role": "system",
+          "content": [
+            {
+              "type": "text",
+              "text": "hello"
+            }
+          ]
+        }
+      ],
+      "code": "bad_slice",
+      "uuid": ""
+    },
+    {
+      "name": "text_block_without_text",
+      "wire": [
+        {
+          "uuid": "c41d7b90-3a62-4f18-9d05-7e2b6a0c8f31",
+          "role": "user",
+          "content": [
+            {
+              "type": "text"
+            }
+          ]
+        }
+      ],
+      "code": "bad_slice",
+      "uuid": ""
+    },
+    {
+      "name": "not_a_list",
+      "wire": {
+        "uuid": "c41d7b90-3a62-4f18-9d05-7e2b6a0c8f31",
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "hello"
+          }
+        ]
+      },
+      "code": "bad_slice",
+      "uuid": ""
+    },
+    {
+      "name": "empty_list",
+      "wire": [],
+      "code": "empty_slice",
+      "uuid": ""
+    },
+    {
+      "name": "the_first_offending_message_decides",
+      "wire": [
+        {
+          "uuid": "6f1c0b2e-9d47-4a83-b5e0-2c8fa1d94b67",
+          "role": "user",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "toolu_2",
+              "name": "Bash",
+              "input": {}
+            }
+          ]
+        },
+        {
+          "uuid": "c41d7b90-3a62-4f18-9d05-7e2b6a0c8f31",
+          "role": "user",
+          "content": "plain string"
+        }
+      ],
+      "code": "non_text_block",
+      "uuid": "6f1c0b2e-9d47-4a83-b5e0-2c8fa1d94b67"
+    }
+  ]
+}

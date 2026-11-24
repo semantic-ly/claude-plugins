@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "semanticly": {
+      "type": "http",
+      "url": "${user_config.api_url}/mcp"
+    }
+  }
+}

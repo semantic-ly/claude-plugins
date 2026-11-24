@@ -1,0 +1,45 @@
+{
+  "_comment": "The relative time of a branch's `last write` column: an age in whole seconds and the string printed for it. tests/cli/test_relative_time.py reads these against the CLI's `ago_full`, and the console prints the same strings from its own copy.",
+  "cases": [
+    {
+      "seconds": 0,
+      "expected": "now"
+    },
+    {
+      "seconds": 59,
+      "expected": "now"
+    },
+    {
+      "seconds": 60,
+      "expected": "1m ago"
+    },
+    {
+      "seconds": 3599,
+      "expected": "59m ago"
+    },
+    {
+      "seconds": 3600,
+      "expected": "1h ago"
+    },
+    {
+      "seconds": 86399,
+      "expected": "23h ago"
+    },
+    {
+      "seconds": 86400,
+      "expected": "1d ago"
+    },
+    {
+      "seconds": 2332800,
+      "expected": "27d ago"
+    },
+    {
+      "seconds": 2419200,
+      "expected": "4w ago"
+    },
+    {
+      "seconds": 7776000,
+      "expected": "12w ago"
+    }
+  ]
+}

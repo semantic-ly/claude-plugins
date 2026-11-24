@@ -1,0 +1,26 @@
+{
+  "name": "semanticly",
+  "version": "0.1.0",
+  "description": "Hooks recall a repo's remembered facts into each session and post the transcript for fact extraction, a skill teaches when to recall and remember, and a connector reaches the Semantic.ly MCP mount. Installs in Claude Code and in Cowork.",
+  "author": {
+    "name": "Semantic.ly",
+    "url": "https://github.com/semantic-ly"
+  },
+  "repository": "https://github.com/semantic-ly/claude-plugins",
+  "license": "UNLICENSED",
+  "keywords": [
+    "memory",
+    "recall",
+    "facts",
+    "mcp",
+    "semanticly"
+  ],
+  "userConfig": {
+    "api_url": {
+      "type": "string",
+      "title": "Semantic.ly API host",
+      "description": "The origin of the Semantic.ly agent API, without a path.",
+      "default": "https://api.semantic.ly"
+    }
+  }
+}
