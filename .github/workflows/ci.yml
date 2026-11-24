@@ -1,9 +1,9 @@
 name: CI
 
+# Pull requests run this directly. A push to main runs it through the release
+# workflow, which calls it before publishing.
 on:
   pull_request:
-  push:
-    branches: [main]
   workflow_call:
 
 permissions:
