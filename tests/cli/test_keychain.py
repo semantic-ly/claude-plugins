@@ -26,8 +26,9 @@ UNSCOPED_SECRET = "slt_unscoped_00112233445566778899aabbccdd"
 NOT_SIGNED_IN = "Not signed in. Run `semanticly login`."
 NO_REPO_TOKEN = "No token for `acme/support`. Run `semanticly init` in a terminal."
 NO_KEYCHAIN = (
-    "No OS keychain is available (`security` or `secret-tool`), so `login` "
-    "stores nothing. A script can set SEMANTICLY_TOKEN."
+    "No OS keychain is available (`security`, `secret-tool` or the Windows "
+    "Credential Manager), so `login` stores nothing. A script can set "
+    "SEMANTICLY_TOKEN."
 )
 
 
@@ -255,6 +256,52 @@ class KeychainBackendTests(KeychainTestCase):
                         cli.keychain_set("acme/support", secret)
                     self.assertNotIn("slt_", str(caught.exception))
         self.assertEqual(shim.calls(), [], "nothing reached the tool")
+
+    def test_windows_stores_and_reads_through_the_credential_manager(self):
+        """Drives `keychain_set` and `keychain_get` on win32 over a stand-in store.
+
+        The stand-in replaces the two advapi32 calls alone, so the target
+        name, the read-back and the token rule are the CLI's own.
+        """
+
+        self.mount_without_token()
+        shim = self.install_keychain()
+        store: dict[str, str] = {}
+
+        def write(target, account, secret):
+            store[target] = secret
+            return True
+
+        with unittest.mock.patch.object(cli.sys, "platform", "win32"), \
+                unittest.mock.patch.object(cli, "wincred_write", write), \
+                unittest.mock.patch.object(cli, "wincred_read", store.get):
+            self.assertEqual(cli.keychain_backend(), cli.WINDOWS_CREDENTIALS)
+            cli.keychain_set("acme/support", SECRET)
+            self.assertEqual(cli.keychain_get("acme/support"), SECRET)
+            self.assertIsNone(cli.keychain_get("acme/missing"))
+            store["semanticly:" + f"{self.host()}:acme/bad"] = "not a token!"
+            with self.assertRaises(cli.CliError) as caught:
+                cli.keychain_get("acme/bad")
+            self.assertNotIn("not a token!", str(caught.exception))
+
+        self.assertEqual(store["semanticly:" + f"{self.host()}:acme/support"], SECRET)
+        self.assertEqual(shim.calls(), [], "no keychain tool runs on Windows")
+
+    def test_a_refused_windows_write_is_said_and_stores_nothing(self):
+        self.mount_without_token()
+        with unittest.mock.patch.object(cli.sys, "platform", "win32"), \
+                unittest.mock.patch.object(cli, "wincred_write", lambda *a: False), \
+                unittest.mock.patch.object(cli, "wincred_read", lambda target: None):
+            with self.assertRaises(cli.CliError) as caught:
+                cli.keychain_set("acme/support", SECRET)
+        self.assertIn("Windows Credential Manager", str(caught.exception))
+        self.assertNotIn(SECRET, str(caught.exception))
+
+    def test_the_credential_manager_calls_answer_nothing_off_windows(self):
+        if sys.platform == "win32":
+            self.skipTest("this machine has the Credential Manager")
+        self.assertIsNone(cli.wincred_read("semanticly:anything"))
+        self.assertFalse(cli.wincred_write("semanticly:anything", "anything", SECRET))
 
     def test_secret_tool_stores_and_looks_up_by_service_and_account(self):
         """Drives `keychain_set` and `keychain_get` over `secret-tool` off darwin."""

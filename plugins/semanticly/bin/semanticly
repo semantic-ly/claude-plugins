@@ -1,5 +1,19 @@
-#!/usr/bin/env python3
-"""semanticly — a thin CLI over the Semantic.ly agent API.
+#!/bin/sh
+""":"
+# A shell runs these lines and hands the file to the first Python 3.9 or later
+# on PATH. Windows often has `python` or `py` and no `python3`. Python reads
+# the same lines as the start of this docstring.
+for candidate in python3 python py; do
+  if command -v "$candidate" >/dev/null 2>&1 &&
+     "$candidate" -c 'import sys; raise SystemExit(sys.version_info < (3, 9))' >/dev/null 2>&1; then
+    exec "$candidate" "$0" "$@"
+  fi
+done
+echo "semanticly: no Python 3.9 or later is on PATH." >&2
+exit 127
+":
+
+semanticly — a thin CLI over the Semantic.ly agent API.
 
 Python 3.9 or later, stdlib only, one file. `urllib.request` and `json` cover every
 subcommand, so the plugin installs by copying a file and never by resolving a
@@ -148,9 +162,14 @@ KEYCHAIN_TIMEOUT = 30.0
 TOKEN_RULE = re.compile(r"[A-Za-z0-9_-]{1,512}")
 
 NO_KEYCHAIN = (
-    "No OS keychain is available (`security` or `secret-tool`), so `login` "
-    "stores nothing. A script can set SEMANTICLY_TOKEN."
+    "No OS keychain is available (`security`, `secret-tool` or the Windows "
+    "Credential Manager), so `login` stores nothing. A script can set "
+    "SEMANTICLY_TOKEN."
 )
+
+# The backend `keychain_backend` names on Windows, where the store is the
+# Credential Manager and no tool is run.
+WINDOWS_CREDENTIALS = "wincred"
 NOT_SIGNED_IN = "Not signed in. Run `semanticly login`."
 
 # What a refusal's code tells a person to do, appended to the server's sentence.
@@ -468,11 +487,14 @@ def token_for(cfg: Config, repo: str | None, *, write: bool = False) -> str:
 
 
 def keychain_backend() -> str | None:
-    """The path of the OS keychain tool, or None when neither is on `PATH`.
+    """The OS keychain to use, or None when there is none.
 
-    `security` counts on macOS alone. Everywhere else it is `secret-tool`.
+    Windows answers WINDOWS_CREDENTIALS. macOS answers the path of
+    `security`, and everywhere else the path of `secret-tool`.
     """
 
+    if sys.platform == "win32":
+        return WINDOWS_CREDENTIALS
     if sys.platform == "darwin":
         found = shutil.which("security")
         if found:
@@ -521,14 +543,17 @@ def keychain_get(scope: str, *, origin: str | None = None) -> str | None:
     if tool is None:
         return None
     account = keychain_account(scope, origin)
-    if Path(tool).name == "security":
-        argv = [tool, "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"]
+    if tool == WINDOWS_CREDENTIALS:
+        secret = wincred_read(wincred_target(account)) or ""
     else:
-        argv = [tool, "lookup", "service", KEYCHAIN_SERVICE, "account", account]
-    done = run_keychain_tool(argv, "")
-    if done is None or done.returncode != 0:
-        return None
-    secret = done.stdout.strip()
+        if Path(tool).name == "security":
+            argv = [tool, "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"]
+        else:
+            argv = [tool, "lookup", "service", KEYCHAIN_SERVICE, "account", account]
+        done = run_keychain_tool(argv, "")
+        if done is None or done.returncode != 0:
+            return None
+        secret = done.stdout.strip()
     if not secret:
         return None
     if not TOKEN_RULE.fullmatch(secret):
@@ -550,6 +575,12 @@ def keychain_set(scope: str, secret: str, *, origin: str | None = None) -> None:
     if not TOKEN_RULE.fullmatch(secret):
         raise CliError(f"The token for `{scope}` is malformed, so nothing was stored.")
     account = keychain_account(scope, origin)
+    if tool == WINDOWS_CREDENTIALS:
+        stored = wincred_write(wincred_target(account), account, secret)
+        if not stored or keychain_get(scope, origin=origin) != secret:
+            raise CliError(f"The Windows Credential Manager did not store the token "
+                           f"for `{scope}`.")
+        return
     if Path(tool).name == "security":
         argv = [tool, "-i"]
         stdin = (f"add-generic-password -U -s {KEYCHAIN_SERVICE} "
@@ -562,6 +593,101 @@ def keychain_set(scope: str, secret: str, *, origin: str | None = None) -> None:
     if done is None or done.returncode != 0 or keychain_get(scope, origin=origin) != secret:
         raise CliError(f"The OS keychain (`{Path(tool).name}`) did not store the token "
                        f"for `{scope}`.")
+
+
+# --- the Windows Credential Manager ------------------------------------------
+#
+# One generic credential per keychain account, named `semanticly:{account}`.
+# The token is the credential's blob, as UTF-8. The calls go to advapi32
+# through ctypes, so Windows needs no tool on `PATH` and no dependency.
+
+WINCRED_TYPE_GENERIC = 1
+WINCRED_PERSIST_LOCAL_MACHINE = 2
+
+
+def wincred_target(account: str) -> str:
+    """The credential's target name for one keychain account."""
+
+    return f"{KEYCHAIN_SERVICE}:{account}"
+
+
+def wincred_api():
+    """advapi32 and its CREDENTIALW structure, or None off Windows."""
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    except (ImportError, AttributeError, OSError):
+        return None
+
+    class Credential(ctypes.Structure):
+        _fields_ = [
+            ("Flags", wintypes.DWORD),
+            ("Type", wintypes.DWORD),
+            ("TargetName", wintypes.LPWSTR),
+            ("Comment", wintypes.LPWSTR),
+            ("LastWritten", wintypes.FILETIME),
+            ("CredentialBlobSize", wintypes.DWORD),
+            ("CredentialBlob", ctypes.POINTER(ctypes.c_ubyte)),
+            ("Persist", wintypes.DWORD),
+            ("AttributeCount", wintypes.DWORD),
+            ("Attributes", ctypes.c_void_p),
+            ("TargetAlias", wintypes.LPWSTR),
+            ("UserName", wintypes.LPWSTR),
+        ]
+
+    pointer = ctypes.POINTER(Credential)
+    advapi32.CredWriteW.argtypes = [pointer, wintypes.DWORD]
+    advapi32.CredWriteW.restype = wintypes.BOOL
+    advapi32.CredReadW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                   ctypes.POINTER(pointer)]
+    advapi32.CredReadW.restype = wintypes.BOOL
+    advapi32.CredFree.argtypes = [ctypes.c_void_p]
+    advapi32.CredFree.restype = None
+    return ctypes, advapi32, Credential
+
+
+def wincred_read(target: str) -> str | None:
+    """The stored blob for `target` as text, or None when there is none to read."""
+
+    api = wincred_api()
+    if api is None:
+        return None
+    ctypes, advapi32, Credential = api
+    found = ctypes.POINTER(Credential)()
+    if not advapi32.CredReadW(target, WINCRED_TYPE_GENERIC, 0, ctypes.byref(found)):
+        return None
+    try:
+        blob = ctypes.string_at(found.contents.CredentialBlob,
+                                found.contents.CredentialBlobSize)
+    finally:
+        advapi32.CredFree(found)
+    try:
+        return blob.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return None
+
+
+def wincred_write(target: str, account: str, secret: str) -> bool:
+    """Store `secret` as the blob for `target`. False when the store refused."""
+
+    api = wincred_api()
+    if api is None:
+        return False
+    ctypes, advapi32, Credential = api
+    blob = secret.encode("utf-8")
+    buffer = (ctypes.c_ubyte * len(blob)).from_buffer_copy(blob)
+    credential = Credential()
+    credential.Type = WINCRED_TYPE_GENERIC
+    credential.TargetName = target
+    credential.Comment = f"Semantic.ly {account}"
+    credential.CredentialBlobSize = len(blob)
+    credential.CredentialBlob = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte))
+    credential.Persist = WINCRED_PERSIST_LOCAL_MACHINE
+    credential.UserName = account
+    return bool(advapi32.CredWriteW(ctypes.byref(credential), 0))
 
 
 def security_quote(value: str) -> str:
@@ -2618,7 +2744,24 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def use_utf8_streams() -> None:
+    """Read and write UTF-8 on Windows, whose pipes default to a legacy code page.
+
+    A fact or a prompt outside that code page would otherwise fail to print
+    or arrive garbled. A stream that cannot be reconfigured is left as it is.
+    """
+
+    if sys.platform != "win32":
+        return
+    for stream, errors in ((sys.stdin, "strict"), (sys.stdout, "replace"),
+                           (sys.stderr, "replace")):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors=errors)
+
+
 def main(argv: list[str] | None = None) -> int:
+    use_utf8_streams()
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)

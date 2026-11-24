@@ -41,8 +41,10 @@ if [ ! -x "$cli" ]; then
   exit 0
 fi
 
-if ! command -v python3 >/dev/null 2>&1; then
-  note "python3 is not on PATH; nothing captured"
+py=""
+[ -r "$root/hooks/find-python.sh" ] && . "$root/hooks/find-python.sh"
+if [ -z "$py" ]; then
+  note "no Python 3.9 or later is on PATH; nothing captured"
   exit 0
 fi
 
@@ -55,7 +57,7 @@ last_line() { grep -v '^[[:space:]]*$' "$errlog" | tail -n 1; }
 # The payload's session id, the memory directory beside its transcript,
 # then the repository the project's `.semanticly` names, one per line.
 reader_exit=0
-located="$(python3 "$root/hooks/hook_inputs.py" memory 2>"$errlog")" || reader_exit=$?
+located="$("$py" "$root/hooks/hook_inputs.py" memory 2>"$errlog")" || reader_exit=$?
 case "$reader_exit" in
   0) ;;
   "$INPUTS_STOP") note "$(last_line)"; exit 0 ;;
@@ -72,10 +74,10 @@ fi
 # The log line is the answer's headline, or the last line the CLI or the
 # headline reader wrote when there is none.
 : >"$errlog"
-answer="$("$cli" ingest --repo "$repo" --session-id "$session" \
+answer="$("$py" "$cli" ingest --repo "$repo" --session-id "$session" \
   --memory-dir "$memory" --json 2>"$errlog")"
 
-said="$(printf '%s' "$answer" | python3 "$root/hooks/headline.py" 2>>"$errlog")"
+said="$(printf '%s' "$answer" | "$py" "$root/hooks/headline.py" 2>>"$errlog")"
 if [ -z "$said" ]; then
   said="$(last_line)"
 fi

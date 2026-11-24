@@ -1,0 +1,3 @@
+# The hooks and the CLI run under bash and sh, which fail on CRLF line
+# endings. A Windows checkout with core.autocrlf would add them.
+* text=auto eol=lf

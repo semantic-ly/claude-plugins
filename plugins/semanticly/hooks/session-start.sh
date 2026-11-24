@@ -39,8 +39,10 @@ if [ ! -x "$cli" ]; then
   exit 0
 fi
 
-if ! command -v python3 >/dev/null 2>&1; then
-  note "python3 is not on PATH; nothing recalled"
+py=""
+[ -r "$root/hooks/find-python.sh" ] && . "$root/hooks/find-python.sh"
+if [ -z "$py" ]; then
+  note "no Python 3.9 or later is on PATH; nothing recalled"
   exit 0
 fi
 
@@ -144,7 +146,7 @@ PY
 # The repository the project's `.semanticly` names, then the payload's
 # session id, one per line.
 reader_exit=0
-located="$(python3 "$root/hooks/hook_inputs.py" session-start 2>"$errlog")" || reader_exit=$?
+located="$("$py" "$root/hooks/hook_inputs.py" session-start 2>"$errlog")" || reader_exit=$?
 case "$reader_exit" in
   0) ;;
   "$INPUTS_STOP") note "$(last_line)"; exit 0 ;;
@@ -159,7 +161,7 @@ if [ -z "$repo" ]; then
     note "Cowork binds by its own recall call; nothing recalled"
     exit 0
   fi
-  python3 -c "$ENCODE_PY" "" </dev/null
+  "$py" -c "$ENCODE_PY" "" </dev/null
   note "no .semanticly at or above the project; nothing recalled"
   exit 0
 fi
@@ -170,10 +172,10 @@ if [ -z "$session" ]; then
 fi
 
 : >"$errlog"
-answer="$("$cli" recall --repo "$repo" --session "$session" --standing --json 2>"$errlog")"
+answer="$("$py" "$cli" recall --repo "$repo" --session "$session" --standing --json 2>"$errlog")"
 
 encoded=1
-printf '%s' "$answer" | python3 -c "$ENCODE_PY" "$repo" || encoded=0
+printf '%s' "$answer" | "$py" -c "$ENCODE_PY" "$repo" || encoded=0
 
 said="$(last_line)"
 if [ -n "$said" ]; then

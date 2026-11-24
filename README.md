@@ -31,8 +31,11 @@ repository.
 
 - An invitation from Semantic.ly
 - `python3` on your `PATH`, version 3.9 or later
-- An OS keychain for the CLI's sign-in, which is `security` on macOS and
-  `secret-tool` on Linux
+- An OS keychain for the CLI's sign-in, which is `security` on macOS,
+  `secret-tool` on Linux and the Credential Manager on Windows
+- On Windows, [Git for Windows](https://git-scm.com/download/win), because
+  the plugin's hooks are bash scripts and Claude Code runs them through Git
+  Bash
 
 ## Claude Code
 
@@ -69,6 +72,17 @@ repository.
 
 The CLI reaches `https://api.semantic.ly` with no configuration. You need no
 environment variable.
+
+### Windows
+
+The steps are the same, with three differences.
+
+- Skip `chmod`. In PowerShell or Command Prompt, run the CLI through Python,
+  as `python semanticly login` and `python semanticly init --repo <org>/<repo>`.
+- Run `init` in PowerShell, Command Prompt or Windows Terminal. In the Git
+  Bash window `init` cannot tell that it has a terminal, so it only lists the
+  repositories and binds nothing.
+- Python can be on `PATH` as `python3`, `python` or `py`.
 
 The plugin adds three commands.
 
@@ -138,6 +152,7 @@ root.
 python3 -m unittest discover -s tests/cli -t tests/cli
 python3 -m unittest discover -s tests/plugin -t tests/plugin
 python3 -m unittest discover -s tests/package -t tests/package
+python3 -m unittest discover -s tests/smoke -t tests/smoke
 ```
 
 One plugin test runs `claude plugin validate --strict` and is skipped when

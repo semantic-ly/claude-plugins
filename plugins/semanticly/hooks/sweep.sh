@@ -38,8 +38,10 @@ if [ ! -x "$cli" ]; then
   exit 0
 fi
 
-if ! command -v python3 >/dev/null 2>&1; then
-  note "python3 is not on PATH; nothing swept"
+py=""
+[ -r "$root/hooks/find-python.sh" ] && . "$root/hooks/find-python.sh"
+if [ -z "$py" ]; then
+  note "no Python 3.9 or later is on PATH; nothing swept"
   exit 0
 fi
 
@@ -52,7 +54,7 @@ last_line() { grep -v '^[[:space:]]*$' "$errlog" | tail -n 1; }
 # The bound repository, then the directory of the payload's
 # `transcript_path`, one per line.
 reader_exit=0
-located="$(python3 "$root/hooks/hook_inputs.py" sweep 2>"$errlog")" || reader_exit=$?
+located="$("$py" "$root/hooks/hook_inputs.py" sweep 2>"$errlog")" || reader_exit=$?
 case "$reader_exit" in
   0) ;;
   "$INPUTS_STOP") note "$(last_line)"; exit 0 ;;
@@ -74,7 +76,7 @@ fi
 # The CLI's stdout is the per-session answer, which nobody reads in a
 # background hook.
 : >"$errlog"
-"$cli" ingest --repo "$repo" --sweep "$directory" --surface claude-code \
+"$py" "$cli" ingest --repo "$repo" --sweep "$directory" --surface claude-code \
   >/dev/null 2>"$errlog"
 
 said="$(last_line)"

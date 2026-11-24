@@ -44,8 +44,10 @@ if [ ! -x "$cli" ]; then
   exit 0
 fi
 
-if ! command -v python3 >/dev/null 2>&1; then
-  note "python3 is not on PATH; nothing recalled"
+py=""
+[ -r "$root/hooks/find-python.sh" ] && . "$root/hooks/find-python.sh"
+if [ -z "$py" ]; then
+  note "no Python 3.9 or later is on PATH; nothing recalled"
   exit 0
 fi
 
@@ -89,7 +91,7 @@ PY
 )
 
 reader_exit=0
-inputs="$(python3 "$root/hooks/prompt_inputs.py" "$cowork" 2>"$errlog")" || reader_exit=$?
+inputs="$("$py" "$root/hooks/prompt_inputs.py" "$cowork" 2>"$errlog")" || reader_exit=$?
 case "$reader_exit" in
   0) ;;
   "$INPUTS_OFF") exit 0 ;;
@@ -103,7 +105,7 @@ notes="${inputs%%$'\n'*}"; prompt="${inputs#*$'\n'}"
 # `--` before the prompt, so a prompt opening with a dash is a query.
 : >"$errlog"
 recalled=1
-facts="$("$cli" recall --repo "$repo" --session "$session" \
+facts="$("$py" "$cli" recall --repo "$repo" --session "$session" \
   --token-budget "$PROMPT_BUDGET" --surface "$surface" -- "$prompt" 2>"$errlog")" \
   || recalled=0
 
@@ -115,7 +117,7 @@ fi
 
 output=""
 if [ "$recalled" = 1 ]; then
-  output="$(printf '%s' "$facts" | python3 -c "$ENCODE_PY" "$repo")" \
+  output="$(printf '%s' "$facts" | "$py" -c "$ENCODE_PY" "$repo")" \
     || said="${said:+$said; }could not encode the recalled facts; this turn goes without them"
 fi
 

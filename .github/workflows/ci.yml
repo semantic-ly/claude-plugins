@@ -53,6 +53,28 @@ jobs:
       - name: Packaging tests
         run: python3 -m unittest discover -s tests/package -t tests/package
 
+      - name: Smoke tests
+        run: python3 -m unittest discover -s tests/smoke -t tests/smoke
+
+  # The CLI and plugin suites stand in for the OS keychain with executables
+  # that Windows cannot run, so Windows runs the smoke suite alone. It starts
+  # the real CLI and hooks and stores a token in the real Credential Manager.
+  windows:
+    name: Windows smoke tests
+    runs-on: windows-latest
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Smoke tests
+        run: python -m unittest discover -v -s tests/smoke -t tests/smoke
+
   floor:
     name: Python 3.9 floor
     runs-on: ubuntu-latest
