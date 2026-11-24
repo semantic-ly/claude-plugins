@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      # The suites use names newer than 3.9. The floor job covers the CLI's
+      # own minimum.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # One plugin test runs `claude plugin validate --strict` and skips when
+      # `claude` is missing, so a failed install must fail the job here.
+      - name: Install Claude Code
+        run: |
+          npm install --global @anthropic-ai/claude-code
+          claude --version
+
+      - name: CLI tests
+        run: python3 -m unittest discover -s tests/cli -t tests/cli
+
+      - name: Plugin tests
+        run: python3 -m unittest discover -s tests/plugin -t tests/plugin
+
+      - name: Packaging tests
+        run: python3 -m unittest discover -s tests/package -t tests/package
+
+      - name: Smoke tests
+        run: python3 -m unittest discover -s tests/smoke -t tests/smoke
+
+  # The CLI and plugin suites stand in for the OS keychain with executables
+  # that Windows cannot run, so Windows runs the smoke suite alone. It starts
+  # the real CLI and hooks and stores a token in the real Credential Manager.
+  windows:
+    name: Windows smoke tests
+    runs-on: windows-latest
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Smoke tests
+        run: python -m unittest discover -v -s tests/smoke -t tests/smoke
+
+  floor:
+    name: Python 3.9 floor
+    runs-on: ubuntu-latest
+    # The runner image no longer offers Python 3.9, so the job runs in the
+    # official image for it.
+    container: python:3.9
+    timeout-minutes: 5
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show the Python version
+        run: python3 --version
+
+      - name: Compile the CLI and the hooks
+        run: |
+          python3 - plugins/semanticly/bin/semanticly plugins/semanticly/hooks/*.py <<'PY'
+          import sys
+
+          for path in sys.argv[1:]:
+              with open(path, encoding="utf-8") as handle:
+                  compile(handle.read(), path, "exec")
+              print("compiled", path)
+          PY
+
+      - name: Run the CLI
+        run: |
+          python3 plugins/semanticly/bin/semanticly --help
+          plugins/semanticly/bin/semanticly --help
+
+  build:
+    name: Build release assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          scripts/package.sh dist/semanticly-skill.zip
+          cp -p plugins/semanticly/bin/semanticly dist/semanticly
+          cd dist
+          sha256sum semanticly semanticly-skill.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14

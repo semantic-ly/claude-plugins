@@ -1,0 +1,17 @@
+{
+  "name": "semanticly",
+  "owner": {
+    "name": "Semantic.ly",
+    "url": "https://github.com/semantic-ly"
+  },
+  "metadata": {
+    "description": "Plugins that connect Claude to Semantic.ly, a federated memory store for AI agents."
+  },
+  "plugins": [
+    {
+      "name": "semanticly",
+      "source": "./plugins/semanticly",
+      "description": "Hooks recall a repo's remembered facts into each session and post the transcript for fact extraction, a skill teaches when to recall and remember, and a connector reaches the Semantic.ly MCP mount. Installs in Claude Code and in Cowork."
+    }
+  ]
+}

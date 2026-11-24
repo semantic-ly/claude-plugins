@@ -1,0 +1,2785 @@
+#!/bin/sh
+""":"
+# A shell runs these lines and hands the file to the first Python 3.9 or later
+# on PATH. Windows often has `python` or `py` and no `python3`. Python reads
+# the same lines as the start of this docstring. The `py` launcher would act
+# on this file's `#!/bin/sh` line, so it is asked for its interpreter's path.
+for candidate in python3 python py; do
+  command -v "$candidate" >/dev/null 2>&1 || continue
+  if [ "$candidate" = py ]; then
+    candidate="$(py -3 -c 'import sys; print(sys.executable)' 2>/dev/null | tr -d '\r')"
+    [ -n "$candidate" ] || continue
+  fi
+  if "$candidate" -c 'import sys; raise SystemExit(sys.version_info < (3, 9))' >/dev/null 2>&1; then
+    exec "$candidate" "$0" "$@"
+  fi
+done
+echo "semanticly: no Python 3.9 or later is on PATH." >&2
+exit 127
+":
+
+semanticly — a thin CLI over the Semantic.ly agent API.
+
+Python 3.9 or later, stdlib only, one file. `urllib.request` and `json` cover every
+subcommand, so the plugin installs by copying a file and never by resolving a
+dependency tree. Tools are called over the MCP mount at `{api_url}/mcp`, and
+`whoami` and `export` read `{api_url}/v1`.
+
+    semanticly recall --repo acme/support "refund policy"
+    semanticly remember --repo acme/support --topic billing "Refunds are 30 days."
+    semanticly ingest --repo acme/support --session-id abc --transcript t.jsonl
+    semanticly ingest --repo acme/support --session-id abc --memory-dir memory
+    semanticly export --repo acme/support --ref v1.4 --format claude-md
+    semanticly whoami
+    semanticly login --repo acme/support
+    semanticly init --repo acme/support
+
+The host comes from the environment first, `~/.semanticly/config.json`
+second and the public origin last. The destination repo comes from `--repo` or
+the nearest `.semanticly` file and is never guessed — see `resolve_repo`. The
+token comes from `SEMANTICLY_TOKEN` or the OS keychain — see `token_for`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import contextlib
+import hashlib
+import http.client
+import http.server
+import ipaddress
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+from datetime import datetime, timezone
+from pathlib import Path
+
+# The server's ceiling on one recall's `exclude_facts`, its `MaxExcludeFacts`.
+# A request past it is refused with `422 too_many_exclusions`, so the CLI never
+# sends one.
+SERVER_MAX_EXCLUSIONS = 500
+
+# The client's ceiling on one session's recorded ids, standing and tail
+# together. The tail gives way first, so standing ids alone can pass it, and
+# SERVER_MAX_EXCLUSIONS then cuts what is sent.
+MAX_SESSION_EXCLUSIONS = 400
+
+# Stock macOS ships Python 3.9, so the CLI and the hooks stay on 3.9 syntax and
+# names. `datetime.UTC` is 3.11.
+UTC = timezone.utc  # noqa: UP017
+
+# The layers whose lines are new to a session. A per-turn block holding none
+# of them prints nothing.
+NEW_LAYERS = ("term", "semantic")
+
+# The surface a command reports as `clientInfo.name` when nothing names one.
+DEFAULT_SURFACE = "claude-code"
+
+# The levels whose sessions are captured. A session recorded below them, or
+# with no level, posts nothing.
+CAPTURE_LEVELS = ("write", "admin")
+
+# The transcript rows that carry conversation, and the batch statuses that
+# say the road took a slice in.
+TRANSCRIPT_ROLES = ("user", "assistant")
+ACCEPTED_STATUSES = ("queued", "extracting", "done")
+
+# The refusals that end a sweep, because they hold for every session in it.
+# Any other refusal skips its own session and the sweep goes on.
+SWEEP_STOP_STATUSES = (401, 403, 503)
+SWEEP_STOP_CODES = ("invalid_token", "insufficient_level", "no_branch", "ingest_disabled",
+                    "queue_unavailable")
+
+# Claude Code's own memory. The kept entry types, the surface
+# and session_ref prefix its posts carry, and the frontmatter delimiter.
+MEMORY_KEPT_TYPES = ("project", "feedback")
+MEMORY_SURFACE = "claude-code-memory"
+MEMORY_REF_PREFIX = "claude-code-memory:"
+FRONTMATTER_FENCE = "---"
+FRONTMATTER_KEY = re.compile(r"[ \t]*[A-Za-z_][\w-]*[ \t]*:")
+
+# The widest message uuid the server takes, Go's `maxUUIDChars`. A row whose
+# uuid is wider, or holds a control character, would fail the whole post.
+MAX_UUID_CHARS = 64
+
+# The ceiling on reading one state file under `~/.semanticly`. Nothing this
+# CLI writes there comes near it, so a file over the cap is one something else
+# wrote, and it is skipped rather than read whole.
+STATE_FILE_MAX_BYTES = 262_144
+
+# One listing page. `GET /v1/repos/{repo}/facts` caps `top_k` at 500 server
+# side, so asking for more only wastes the round trip.
+LIST_PAGE = 500
+
+# The ceiling on one export's walk. 500 pages of 500 is a quarter of a million
+# facts, well past any repo, so reaching it means the cursor stopped advancing
+# rather than that the repo is large. An unbounded loop here would spin forever
+# in an unattended hook.
+MAX_PAGES = 500
+
+# Why a walk stopped short, when it did. Both mean "this is a part, not the
+# whole", and they are kept apart because they differ on the half a reader can
+# act on: a bound can be raised or the export narrowed, a server that dropped
+# its cursor cannot be argued with.
+STOPPED_NO_CURSOR = "no_cursor"
+STOPPED_PAGE_BOUND = "page_bound"
+
+# The interchange document `export --json` writes, which the console's import
+# reads. `sha` joins these from the listing's `sha_full`.
+INTERCHANGE_SCHEMA = 1
+INTERCHANGE_FIELDS = (
+    "body", "kind", "term", "aliases", "topics", "rationale", "confidence",
+    "valid_from", "valid_to", "assertions", "display_id",
+)
+
+# The public agent API origin. The plugin's connector names the same value, so
+# the CLI and the connector agree with no configuration.
+PUBLIC_API_ORIGIN = "https://api.semantic.ly"
+
+# The opt-in for a remote `http://` API origin. Without it the CLI refuses one.
+ALLOW_HTTP_ENV = "SEMANTICLY_ALLOW_HTTP"
+
+# The marker file naming a project's repository, and its one allowed shape.
+# Both halves follow the console's slug rule, and one line ending is optional.
+SEMANTICLY_FILE = ".semanticly"
+SEMANTICLY_FILE_MAX_BYTES = 128
+SEMANTICLY_FILE_RULE = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*/[a-z0-9]+(-[a-z0-9]+)*(\r?\n)?")
+
+# The keychain entries. The account is `{api host}:{scope}`, and the scope is
+# UNSCOPED for the token `login` stores or `org/slug` for a repository's.
+KEYCHAIN_SERVICE = "semanticly"
+UNSCOPED = "*"
+KEYCHAIN_TIMEOUT = 30.0
+
+# A token's one allowed shape, the URL-safe base64 alphabet. Nothing outside it
+# can break the command line `security -i` reads or an HTTP header.
+TOKEN_RULE = re.compile(r"[A-Za-z0-9_-]{1,512}")
+
+NO_KEYCHAIN = (
+    "No OS keychain is available (`security`, `secret-tool` or the Windows "
+    "Credential Manager), so `login` stores nothing. A script can set "
+    "SEMANTICLY_TOKEN."
+)
+
+# The backend `keychain_backend` names on Windows, where the store is the
+# Credential Manager and no tool is run.
+WINDOWS_CREDENTIALS = "wincred"
+NOT_SIGNED_IN = "Not signed in. Run `semanticly login`."
+
+# What a refusal's code tells a person to do, appended to the server's sentence.
+REMEDIES = {"invalid_token": "Run `semanticly login`."}
+
+# `init`'s copy. GUIDANCE is the console's BRANCH_GUIDANCE_SENTENCE byte for
+# byte, so the picker and `init` give one piece of advice.
+GUIDANCE = (
+    "a team of agents on one project should share one branch; give an untrusted "
+    "or external writer its own."
+)
+TERMINAL_SENTENCE = (
+    "The branch list needs `semanticly init` or `semanticly login` in a terminal."
+)
+
+# `login`'s routes on the agent API, and what it reads from AuthKit.
+MOUNT_PATH = "/mcp"
+CLI_TOKEN_PATH = MOUNT_PATH + "/cli-token"
+RESOURCE_METADATA_PATH = "/.well-known/oauth-protected-resource" + MOUNT_PATH
+AUTHKIT_ENDPOINTS = ("authorization_endpoint", "token_endpoint", "registration_endpoint")
+CLI_CLIENT_NAME = "Semantic.ly CLI"
+LOGIN_TIMEOUT = 300.0
+
+# The Claude Code connector's OAuth client id. `init` binds the connector
+# under it.
+CLAUDE_CODE_CLIENT_ID = "https://claude.ai/oauth/claude-code-client-metadata"
+
+# The CLI's own version, reported to the mount as `clientInfo.version`.
+VERSION = "0.1.0"
+
+# The MCP revision the CLI speaks, and the two framings it reads.
+MCP_PROTOCOL_VERSION = "2025-06-18"
+MCP_ACCEPT = "application/json, text/event-stream"
+
+EXIT_API = 1
+EXIT_USAGE = 2
+
+
+class CliError(Exception):
+    """A configuration or usage failure. Exits 2."""
+
+    exit_code = EXIT_USAGE
+
+
+class TranscriptError(CliError):
+    """A transcript that cannot be read. A sweep skips its session. Exits 2."""
+
+
+class ApiError(CliError):
+    """A `/v1` error envelope, rendered as the server worded it. Exits 1.
+
+    `status` is the HTTP status, or None for a tool's `isError` result, which
+    arrives on a 200. `payload` keeps the envelope for `--json` callers.
+    """
+
+    exit_code = EXIT_API
+
+    def __init__(self, status: int | None, payload: object) -> None:
+        code, message = "http_error", ""
+        if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+            err = payload["error"]
+            code = str(err.get("code") or code)
+            message = str(err.get("message") or "")
+        text = f"{status} {code}" if status is not None else code
+        if message:
+            text += f" — {message}"
+        if code in REMEDIES:
+            text += f" {REMEDIES[code]}"
+        super().__init__(text)
+        self.status = status
+        self.code = code
+        self.payload = payload
+
+    def envelope(self) -> dict:
+        """The refusal as a `/v1` envelope, the server's own when it sent one."""
+
+        if isinstance(self.payload, dict) and isinstance(self.payload.get("error"), dict):
+            return self.payload
+        return {"error": {"code": self.code}}
+
+
+# --- configuration -----------------------------------------------------------
+
+
+def config_home() -> Path:
+    """The config root. `SEMANTICLY_HOME` moves it; nothing else does."""
+
+    override = os.environ.get("SEMANTICLY_HOME")
+    return Path(override) if override else Path.home() / ".semanticly"
+
+
+def config_path() -> Path:
+    return config_home() / "config.json"
+
+
+def read_config_file() -> dict:
+    """`~/.semanticly/config.json`, or an empty mapping.
+
+    A missing or unreadable file is not an error, because the environment and
+    the public origin may cover everything. A file that parses to something
+    other than an object is, since silently ignoring it would hide a typo the
+    user meant to matter.
+    """
+
+    path = config_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise CliError(f"{path} is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise CliError(f"{path} must hold a JSON object.")
+    return parsed
+
+
+def config_string(file_cfg: dict, key: str) -> str:
+    """One string key from the file, or empty. Any other type is refused."""
+
+    value = file_cfg.get(key)
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise CliError(f"`{key}` in {config_path()} must be a string.")
+    return value.strip()
+
+
+def write_config(updates: dict) -> None:
+    """Merge `updates` into the file by temp file and rename.
+
+    Every key the update does not name is kept, so a key another tool wrote
+    survives a login.
+    """
+
+    path = config_path()
+    merged = {**read_config_file(), **updates}
+    body = json.dumps(merged, indent=2, sort_keys=True) + "\n"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".config.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(body)
+            os.replace(tmp, path)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
+    except OSError as exc:
+        raise CliError(f"Could not write {path}: {exc.strerror or exc}") from exc
+
+
+class Config:
+    """What one invocation reads from the environment and the file.
+
+    `token` starts empty, and each command sets it from `token_for` once it
+    knows the repository and whether the call writes.
+    """
+
+    def __init__(self, api_url: str, token: str = "", console_url: str = "",
+                 username: str = "", prompt_recall: bool = True,
+                 timeout: float = 30.0) -> None:
+        self.api_url = api_url
+        self.token = token
+        self.console_url = console_url.rstrip("/")
+        self.username = username
+        self.prompt_recall = prompt_recall
+        self.timeout = timeout
+
+
+def resolve_host(file_cfg: dict) -> str:
+    """The agent API's origin, with one trailing `/v1` stripped.
+
+    `SEMANTICLY_API_URL` comes first, then the plugin's
+    `CLAUDE_PLUGIN_OPTION_API_URL`, then the file's `api_url`, then
+    PUBLIC_API_ORIGIN. A configured `…/v1` keeps working because the strip
+    takes it back to the origin. A source that strips to nothing counts as
+    unset.
+    """
+
+    sources = (
+        os.environ.get("SEMANTICLY_API_URL", ""),
+        os.environ.get("CLAUDE_PLUGIN_OPTION_API_URL", ""),
+        config_string(file_cfg, "api_url"),
+    )
+    for source in sources:
+        origin = strip_v1(source)
+        if origin:
+            return origin
+    return PUBLIC_API_ORIGIN
+
+
+def strip_v1(url: str) -> str:
+    """`url` with surrounding space, trailing slashes and one `/v1` removed."""
+
+    return url.strip().rstrip("/").removesuffix("/v1").rstrip("/")
+
+
+def load_config() -> Config:
+    file_cfg = read_config_file()
+    api_url = resolve_host(file_cfg)
+    check_cleartext(api_url)
+    return Config(
+        api_url,
+        console_url=config_string(file_cfg, "console_url"),
+        username=config_string(file_cfg, "username"),
+        prompt_recall=prompt_recall_from(file_cfg)[0],
+    )
+
+
+def prompt_recall_from(file_cfg: dict) -> tuple[bool, str]:
+    """Whether per-prompt recall runs, and why a malformed value leaves it on.
+
+    Only a literal JSON `false` turns it off. A missing key leaves it on
+    silently. Any other value leaves it on and returns a line saying so.
+    """
+
+    if "prompt_recall" not in file_cfg or isinstance(file_cfg["prompt_recall"], bool):
+        return file_cfg.get("prompt_recall") is not False, ""
+    return True, (f"`prompt_recall` in {config_path()} is not true or false, "
+                  "so per-prompt recall stays on")
+
+
+def prompt_recall_setting() -> tuple[bool, str]:
+    """`prompt_recall_from` over the config file, for the per-prompt hook.
+
+    A malformed file leaves recall on and returns no line, because every
+    command refuses that file in its own words.
+    """
+
+    try:
+        file_cfg = read_config_file()
+    except CliError:
+        return True, ""
+    return prompt_recall_from(file_cfg)
+
+
+def check_cleartext(api_url: str) -> None:
+    """Refuse a remote `http://` origin, which would carry the token in the clear.
+
+    Loopback is exempt and silent, because `http://localhost:8080` is the
+    local stack. `SEMANTICLY_ALLOW_HTTP=1` lets a remote `http://` origin
+    through with a warning, for a self-hosted deployment on a private network.
+
+    Both lines name the scheme and the host, rebuilt from the parsed parts so
+    that userinfo in the URL cannot ride along into a hook log.
+    """
+
+    parsed = urllib.parse.urlsplit(api_url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "http" or is_loopback_host(host):
+        return
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    where = host + (f":{port}" if port else "")
+    if os.environ.get(ALLOW_HTTP_ENV, "").strip() != "1":
+        raise CliError(
+            f"http://{where} is not TLS, so your token would cross the network in "
+            f"cleartext. Use an https:// origin, or set {ALLOW_HTTP_ENV}=1 to allow it."
+        )
+    print(
+        f"semanticly: warning — http://{where} is not TLS, so your token "
+        "crosses the network in cleartext.",
+        file=sys.stderr,
+    )
+
+
+def is_loopback_host(host: str) -> bool:
+    """`localhost`, a `.localhost` name, or a loopback address."""
+
+    host = host.lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+# --- the token ----------------------------------------------------------------
+
+
+def token_for(cfg: Config, repo: str | None, *, write: bool = False) -> str:
+    """The bearer for one call.
+
+    `SEMANTICLY_TOKEN` wins when set. Otherwise the keychain's token for the
+    repository, then the unscoped one. The unscoped token carries `read` alone,
+    so a write never falls back to it and is refused before any request.
+
+    A value outside TOKEN_RULE is refused without echoing it, because a
+    malformed header would raise with the value in its message.
+    """
+
+    from_env = os.environ.get("SEMANTICLY_TOKEN", "").strip()
+    if from_env:
+        if not TOKEN_RULE.fullmatch(from_env):
+            raise CliError("SEMANTICLY_TOKEN is not a token.")
+        return from_env
+    if repo:
+        scoped = keychain_get(repo, origin=cfg.api_url)
+        if scoped:
+            return scoped
+    if write:
+        raise CliError(f"No token for `{repo}`. Run `semanticly init` in a terminal.")
+    unscoped = keychain_get(UNSCOPED, origin=cfg.api_url)
+    if unscoped:
+        return unscoped
+    raise CliError(NOT_SIGNED_IN)
+
+
+# --- the keychain -------------------------------------------------------------
+
+
+def keychain_backend() -> str | None:
+    """The OS keychain to use, or None when there is none.
+
+    Windows answers WINDOWS_CREDENTIALS. macOS answers the path of
+    `security`, and everywhere else the path of `secret-tool`.
+    """
+
+    if sys.platform == "win32":
+        return WINDOWS_CREDENTIALS
+    if sys.platform == "darwin":
+        found = shutil.which("security")
+        if found:
+            return found
+    return shutil.which("secret-tool")
+
+
+def keychain_account(scope: str, origin: str | None = None) -> str:
+    """`{api host}:{scope}`, the host taken from the configured origin.
+
+    The host is rebuilt from the hostname and port, so userinfo in the URL
+    never reaches the tool's argv.
+    """
+
+    parsed = urllib.parse.urlsplit(origin or resolve_host(read_config_file()))
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise CliError(f"{safe_url(parsed.geturl())} has no usable port.") from exc
+    host = parsed.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    if port:
+        host += f":{port}"
+    return f"{host}:{scope}"
+
+
+def run_keychain_tool(argv: list[str], stdin: str) -> subprocess.CompletedProcess | None:
+    """One run of the tool with every stream captured, or None when it cannot run."""
+
+    try:
+        return subprocess.run(argv, input=stdin, capture_output=True, text=True,
+                              timeout=KEYCHAIN_TIMEOUT, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def keychain_get(scope: str, *, origin: str | None = None) -> str | None:
+    """The stored token for `scope`, or None when there is none to read.
+
+    A stored value outside TOKEN_RULE is refused rather than sent, because a
+    malformed header would raise with the value in its message.
+    """
+
+    tool = keychain_backend()
+    if tool is None:
+        return None
+    account = keychain_account(scope, origin)
+    if tool == WINDOWS_CREDENTIALS:
+        secret = wincred_read(wincred_target(account)) or ""
+    else:
+        if Path(tool).name == "security":
+            argv = [tool, "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"]
+        else:
+            argv = [tool, "lookup", "service", KEYCHAIN_SERVICE, "account", account]
+        done = run_keychain_tool(argv, "")
+        if done is None or done.returncode != 0:
+            return None
+        secret = done.stdout.strip()
+    if not secret:
+        return None
+    if not TOKEN_RULE.fullmatch(secret):
+        raise CliError(f"The keychain entry for `{scope}` is not a token. Run `semanticly login`.")
+    return secret
+
+
+def keychain_set(scope: str, secret: str, *, origin: str | None = None) -> None:
+    """Store `secret` for `scope`, with the secret on the tool's stdin.
+
+    `security -i` reads its command from stdin, so the secret never reaches
+    argv. The store is read back, because a failed command inside `-i` need
+    not change the exit code.
+    """
+
+    tool = keychain_backend()
+    if tool is None:
+        raise CliError(NO_KEYCHAIN)
+    if not TOKEN_RULE.fullmatch(secret):
+        raise CliError(f"The token for `{scope}` is malformed, so nothing was stored.")
+    account = keychain_account(scope, origin)
+    if tool == WINDOWS_CREDENTIALS:
+        stored = wincred_write(wincred_target(account), account, secret)
+        if not stored or keychain_get(scope, origin=origin) != secret:
+            raise CliError(f"The Windows Credential Manager did not store the token "
+                           f"for `{scope}`.")
+        return
+    if Path(tool).name == "security":
+        argv = [tool, "-i"]
+        stdin = (f"add-generic-password -U -s {KEYCHAIN_SERVICE} "
+                 f"-a {security_quote(account)} -w {secret}\n")
+    else:
+        argv = [tool, "store", f"--label=Semantic.ly {account}",
+                "service", KEYCHAIN_SERVICE, "account", account]
+        stdin = secret
+    done = run_keychain_tool(argv, stdin)
+    if done is None or done.returncode != 0 or keychain_get(scope, origin=origin) != secret:
+        raise CliError(f"The OS keychain (`{Path(tool).name}`) did not store the token "
+                       f"for `{scope}`.")
+
+
+# --- the Windows Credential Manager ------------------------------------------
+#
+# One generic credential per keychain account, named `semanticly:{account}`.
+# The token is the credential's blob, as UTF-8. The calls go to advapi32
+# through ctypes, so Windows needs no tool on `PATH` and no dependency.
+
+WINCRED_TYPE_GENERIC = 1
+WINCRED_PERSIST_LOCAL_MACHINE = 2
+
+
+def wincred_target(account: str) -> str:
+    """The credential's target name for one keychain account."""
+
+    return f"{KEYCHAIN_SERVICE}:{account}"
+
+
+def wincred_api():
+    """advapi32 and its CREDENTIALW structure, or None off Windows."""
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    except (ImportError, AttributeError, OSError):
+        return None
+
+    class Credential(ctypes.Structure):
+        _fields_ = [
+            ("Flags", wintypes.DWORD),
+            ("Type", wintypes.DWORD),
+            ("TargetName", wintypes.LPWSTR),
+            ("Comment", wintypes.LPWSTR),
+            ("LastWritten", wintypes.FILETIME),
+            ("CredentialBlobSize", wintypes.DWORD),
+            ("CredentialBlob", ctypes.POINTER(ctypes.c_ubyte)),
+            ("Persist", wintypes.DWORD),
+            ("AttributeCount", wintypes.DWORD),
+            ("Attributes", ctypes.c_void_p),
+            ("TargetAlias", wintypes.LPWSTR),
+            ("UserName", wintypes.LPWSTR),
+        ]
+
+    pointer = ctypes.POINTER(Credential)
+    advapi32.CredWriteW.argtypes = [pointer, wintypes.DWORD]
+    advapi32.CredWriteW.restype = wintypes.BOOL
+    advapi32.CredReadW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                   ctypes.POINTER(pointer)]
+    advapi32.CredReadW.restype = wintypes.BOOL
+    advapi32.CredFree.argtypes = [ctypes.c_void_p]
+    advapi32.CredFree.restype = None
+    return ctypes, advapi32, Credential
+
+
+def wincred_read(target: str) -> str | None:
+    """The stored blob for `target` as text, or None when there is none to read."""
+
+    api = wincred_api()
+    if api is None:
+        return None
+    ctypes, advapi32, Credential = api
+    found = ctypes.POINTER(Credential)()
+    if not advapi32.CredReadW(target, WINCRED_TYPE_GENERIC, 0, ctypes.byref(found)):
+        return None
+    try:
+        blob = ctypes.string_at(found.contents.CredentialBlob,
+                                found.contents.CredentialBlobSize)
+    finally:
+        advapi32.CredFree(found)
+    try:
+        return blob.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return None
+
+
+def wincred_write(target: str, account: str, secret: str) -> bool:
+    """Store `secret` as the blob for `target`. False when the store refused."""
+
+    api = wincred_api()
+    if api is None:
+        return False
+    ctypes, advapi32, Credential = api
+    blob = secret.encode("utf-8")
+    buffer = (ctypes.c_ubyte * len(blob)).from_buffer_copy(blob)
+    credential = Credential()
+    credential.Type = WINCRED_TYPE_GENERIC
+    credential.TargetName = target
+    credential.Comment = f"Semantic.ly {account}"
+    credential.CredentialBlobSize = len(blob)
+    credential.CredentialBlob = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte))
+    credential.Persist = WINCRED_PERSIST_LOCAL_MACHINE
+    credential.UserName = account
+    return bool(advapi32.CredWriteW(ctypes.byref(credential), 0))
+
+
+def security_quote(value: str) -> str:
+    """`value` as one double-quoted word on a `security -i` command line."""
+
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        raise CliError("The keychain account holds a control character.")
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+# --- the repository -----------------------------------------------------------
+
+
+def project_root() -> Path:
+    """`CLAUDE_PROJECT_DIR` when a host sets it, else the working directory."""
+
+    override = os.environ.get("CLAUDE_PROJECT_DIR", "").strip()
+    return Path(override) if override else Path.cwd()
+
+
+def find_semanticly(start: Path) -> Path | None:
+    """The nearest `.semanticly` file at or above `start`, or None.
+
+    Only a regular file counts, so `~/.semanticly`, the config directory, is
+    walked past.
+    """
+
+    start = start.resolve()
+    for directory in (start, *start.parents):
+        candidate = directory / SEMANTICLY_FILE
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def read_semanticly(path: Path) -> str:
+    """The `org/slug` a `.semanticly` file holds, or a refusal naming the file.
+
+    The file holds `org/slug` and nothing else, with one optional line ending.
+    The refusal never echoes the content, because a misplaced token is the
+    likeliest thing to be there instead.
+    """
+
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(SEMANTICLY_FILE_MAX_BYTES + 1)
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CliError(f"Could not read {path}. It must hold org/slug on one line.") from exc
+    if not SEMANTICLY_FILE_RULE.fullmatch(text):
+        raise CliError(
+            f"{path} must hold org/slug on one line and nothing else. Run "
+            "`semanticly init` in a terminal to rewrite it."
+        )
+    return text.strip()
+
+
+def resolve_repo(args: argparse.Namespace) -> str:
+    """The destination repo, from `--repo` or the nearest `.semanticly`, or refused.
+
+    An unspecified destination is refused, never guessed. It is
+    never the only repo the token can reach, and never one remembered from
+    last time. `config.json` carries no repo. The project's own `.semanticly`
+    is a person's statement about that project, so it names the destination.
+    """
+
+    flag = (getattr(args, "repo", None) or "").strip()
+    if flag:
+        return flag
+    marker = find_semanticly(project_root())
+    if marker is not None:
+        return read_semanticly(marker)
+    raise CliError(
+        "No repo. Pass --repo org/slug, or run `semanticly init` in a terminal "
+        "to write a .semanticly file at the project root. There is no default "
+        "repo."
+    )
+
+
+# --- HTTP --------------------------------------------------------------------
+
+
+def repo_path(repo: str, suffix: str) -> str:
+    """`/repos/{repo}{suffix}` with the repo escaped whole.
+
+    `acme/support` has to arrive as one path segment, so the slash is escaped.
+    The API accepts the nested spelling too, but only on the read routes.
+    """
+
+    return "/repos/" + urllib.parse.quote(repo, safe="") + suffix
+
+
+def safe_url(url: str) -> str:
+    """`url` with any userinfo stripped, for printing.
+
+    A base URL may carry `user:password@`, and stderr is a hook log. Nothing
+    that reaches it may carry a credential, including one the user typed into
+    their own configuration.
+    """
+
+    parsed = urllib.parse.urlsplit(url)
+    if not parsed.username and not parsed.password:
+        return url
+    host = parsed.hostname or ""
+    if parsed.port:
+        host += f":{parsed.port}"
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, host, parsed.path, parsed.query, parsed.fragment))
+
+
+class NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuses every redirect instead of carrying the bearer token to it.
+
+    The stdlib's default opener follows a 3xx and forwards `Authorization` to
+    whatever `Location` names — any host, any scheme, no origin check. That is
+    a one-response token exfiltration, and it matters here because this CLI is
+    what Claude Code hooks run unattended against a base URL that comes from
+    user config.
+
+    Refusing outright rather than stripping the header cross-origin: neither
+    `/v1` nor `/mcp` redirects, so a 3xx is already an anomaly rather than a case to
+    handle, and a refusal has no second request whose headers could be wrong.
+    An origin comparison is code that has to be right; this is code that
+    cannot be wrong.
+
+    Returning None leaves the 3xx unhandled, so it surfaces as an HTTPError
+    that `http_open` turns into a refusal naming the target.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+OPENER = urllib.request.build_opener(NoRedirects)
+
+
+def nested_repo_path(repo: str, suffix: str) -> str:
+    """`/repos/{org}/{slug}{suffix}`, for the routes registered nested only."""
+
+    org, _, slug = repo.partition("/")
+    if not org or not slug:
+        raise CliError(f"`{repo}` is not org/slug.")
+    quote = urllib.parse.quote
+    return f"/repos/{quote(org, safe='')}/{quote(slug, safe='')}{suffix}"
+
+
+def api(cfg: Config, method: str, path: str, body: dict | None = None,
+        query: dict | None = None) -> tuple[int, object]:
+    url = cfg.api_url + "/v1" + path
+    if query:
+        url += "?" + urllib.parse.urlencode({k: v for k, v in query.items() if v not in (None, "")})
+    return send_json(cfg, method, url, body)
+
+
+def send_json(cfg: Config, method: str, url: str, body: dict | None = None) -> tuple[int, object]:
+    """One JSON request under `cfg.token`, answered as `(status, body)`."""
+
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", f"Bearer {cfg.token}")
+    req.add_header("Accept", "application/json")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    with http_open(cfg, req) as resp:
+        return resp.status, decode_json(resp.read())
+
+
+def public_json(cfg: Config, method: str, url: str, *, json_body: dict | None = None,
+                form: dict | None = None) -> tuple[int, object]:
+    """One request carrying no bearer, for the authorization server's endpoints."""
+
+    data, content_type = None, None
+    if json_body is not None:
+        data, content_type = json.dumps(json_body).encode("utf-8"), "application/json"
+    elif form is not None:
+        data = urllib.parse.urlencode(form).encode("ascii")
+        content_type = "application/x-www-form-urlencoded"
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Accept", "application/json")
+    if content_type:
+        req.add_header("Content-Type", content_type)
+    with http_open(cfg, req) as resp:
+        return resp.status, decode_json(resp.read())
+
+
+@contextlib.contextmanager
+def http_open(cfg: Config, req: urllib.request.Request):
+    """The response to `req` through OPENER, with every failure a CliError.
+
+    A 3xx is refused and names its target redacted. Any other HTTP error
+    raises `ApiError` from its envelope. Reading the body happens inside the
+    block, so a connection that fails mid-read is reported the same way.
+    """
+
+    where = request_origin(cfg, req)
+    try:
+        with OPENER.open(req, timeout=cfg.timeout) as resp:
+            yield resp
+    except urllib.error.HTTPError as exc:
+        if 300 <= exc.code < 400:
+            target = safe_url(exc.headers.get("Location") or "") or "an unnamed target"
+            raise CliError(
+                f"{where} answered {exc.code} redirecting to {target}. The "
+                "API does not redirect, and following one would hand your token "
+                "to whatever answered. Point SEMANTICLY_API_URL at the API "
+                "directly."
+            ) from exc
+        raise ApiError(exc.code, decode_json(exc.read())) from exc
+    except urllib.error.URLError as exc:
+        raise CliError(f"Could not reach {where}: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise CliError(f"{where} did not answer in time.") from exc
+    except http.client.HTTPException as exc:
+        # A malformed base URL lands here rather than as a URLError — an
+        # `InvalidURL` from a stray `@` or a non-numeric port, for one. A
+        # traceback in a hook log would print the whole configured URL.
+        raise CliError(
+            f"{where} is not a usable API URL: {type(exc).__name__}. "
+            "Check SEMANTICLY_API_URL."
+        ) from exc
+
+
+def request_origin(cfg: Config, req: urllib.request.Request) -> str:
+    """The configured API for its own requests, else the origin `req` went to."""
+
+    if req.full_url.startswith(cfg.api_url):
+        return safe_url(cfg.api_url)
+    parts = urllib.parse.urlsplit(req.full_url)
+    return safe_url(urllib.parse.urlunsplit((parts.scheme, parts.netloc, "", "", "")))
+
+
+def decode_json(raw: bytes) -> object:
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+
+
+# --- the MCP client ---------------------------------------------------------
+
+
+def read_rpc_response(resp, request_id: int) -> dict:
+    """The JSON-RPC message answering `request_id`, from a JSON body or an SSE stream.
+
+    A stream is read event by event, and the first `data:` event whose
+    message carries `request_id` with a result or an error is the answer.
+    Notifications and answers to other ids are skipped.
+    """
+
+    if resp.headers.get_content_type() != "text/event-stream":
+        message = decode_json(resp.read())
+        if isinstance(message, dict) and message.get("id") == request_id:
+            return message
+        raise CliError(f"The MCP mount did not answer request {request_id}.")
+    data: list[str] = []
+    while True:
+        raw = resp.readline()
+        line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+        if line.startswith("data:"):
+            data.append(line[5:].removeprefix(" "))
+        elif not line and data:
+            message = decode_json("\n".join(data).encode("utf-8"))
+            data = []
+            if (isinstance(message, dict) and message.get("id") == request_id
+                    and ("result" in message or "error" in message)):
+                return message
+        if not raw:
+            break
+    raise CliError(f"The MCP mount ended its stream without answering request {request_id}.")
+
+
+def rpc_result(message: dict) -> dict:
+    """The `result` of one JSON-RPC answer, or ApiError for its `error`."""
+
+    error = message.get("error")
+    if isinstance(error, dict):
+        raise ApiError(None, {"error": {"code": "mcp_error",
+                                        "message": str(error.get("message") or "")}})
+    result = message.get("result")
+    return result if isinstance(result, dict) else {}
+
+
+def tool_text(result: dict) -> str:
+    """The text blocks of a `CallToolResult`, joined by blank lines."""
+
+    blocks = result.get("content")
+    return "\n\n".join(str(b.get("text") or "") for b in blocks or []
+                       if isinstance(b, dict) and b.get("type") == "text")
+
+
+class McpClient:
+    """One Streamable HTTP session on `{api_url}/mcp`.
+
+    `open` sends `initialize` and then `notifications/initialized`.
+    `tools_call` sends one `tools/call`, and `close` sends one `DELETE`.
+    """
+
+    def __init__(self, cfg: Config, token: str, surface: str) -> None:
+        self.cfg = cfg
+        self.token = token
+        self.surface = surface
+        self.url = cfg.api_url + "/mcp"
+        self.session_id = ""
+        self.protocol_version = ""
+        self.next_id = 1
+
+    def open(self) -> None:
+        """`initialize`, then `notifications/initialized`."""
+
+        params = {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": self.surface, "version": VERSION},
+        }
+        with self.post({"method": "initialize", "params": params, "id": 1}) as resp:
+            result = rpc_result(read_rpc_response(resp, 1))
+            self.session_id = resp.headers.get("Mcp-Session-Id") or ""
+        version = result.get("protocolVersion")
+        self.protocol_version = version if isinstance(version, str) else MCP_PROTOCOL_VERSION
+        with self.post({"method": "notifications/initialized"}) as resp:
+            resp.read()
+
+    def tools_call(self, tool: str, arguments: dict) -> tuple[str, dict]:
+        """`(text, structured)` for one call, or ApiError for an `isError` result."""
+
+        self.next_id += 1
+        request_id = self.next_id
+        body = {"method": "tools/call", "params": {"name": tool, "arguments": arguments},
+                "id": request_id}
+        with self.post(body) as resp:
+            result = rpc_result(read_rpc_response(resp, request_id))
+        structured = result.get("structuredContent")
+        structured = structured if isinstance(structured, dict) else {}
+        text = tool_text(result)
+        if result.get("isError"):
+            envelope = structured if isinstance(structured.get("error"), dict) else {
+                "error": {"code": "tool_error", "message": text}}
+            raise ApiError(None, envelope)
+        return text, structured
+
+    def close(self) -> None:
+        """`DELETE` with the session id. A failure is ignored."""
+
+        if not self.session_id:
+            return
+        req = self.request("DELETE")
+        try:
+            with http_open(self.cfg, req) as resp:
+                resp.read()
+        except (CliError, OSError):
+            pass
+
+    def post(self, message: dict):
+        data = json.dumps({"jsonrpc": "2.0", **message}).encode("utf-8")
+        req = self.request("POST", data)
+        req.add_header("Content-Type", "application/json")
+        return http_open(self.cfg, req)
+
+    def request(self, method: str, data: bytes | None = None) -> urllib.request.Request:
+        """A request on the mount carrying the bearer and, once open, the session."""
+
+        req = urllib.request.Request(self.url, data=data, method=method)
+        req.add_header("Authorization", f"Bearer {self.token}")
+        req.add_header("Accept", MCP_ACCEPT)
+        if self.session_id:
+            req.add_header("Mcp-Session-Id", self.session_id)
+        if self.protocol_version:
+            req.add_header("MCP-Protocol-Version", self.protocol_version)
+        return req
+
+
+def mcp_call(cfg: Config, repo: str | None, tool: str, arguments: dict,
+             surface: str) -> tuple[str, dict]:
+    """One tool call in its own session, `(text, structured)`.
+
+    The bearer is `cfg.token` when a command set it, else the read token for
+    `repo`. The arguments go as given. A repository tool's caller puts `repo`
+    in them, and `list_repos` takes none.
+    """
+
+    token = cfg.token or token_for(cfg, repo)
+    client = McpClient(cfg, token, surface)
+    try:
+        client.open()
+        return client.tools_call(tool, arguments)
+    finally:
+        client.close()
+
+
+# --- the per-session state files ------------------------------------------
+
+
+def read_state_file(path: Path) -> dict:
+    """One small JSON state file as a mapping, or an empty one. Never raises.
+
+    The read stops one byte past STATE_FILE_MAX_BYTES and a file that reaches
+    it is skipped rather than parsed, so a state file somebody else grew
+    cannot pull an unbounded read into a hook. Skipping is said on stderr,
+    because the caller then behaves as if the file were absent.
+
+    Every per-session file goes through here, so the cap is one rule rather
+    than one per file that can drift.
+    """
+
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(STATE_FILE_MAX_BYTES + 1)
+    except OSError:
+        return {}
+    if len(raw) > STATE_FILE_MAX_BYTES:
+        print(f"semanticly: {path} is over {STATE_FILE_MAX_BYTES} bytes and was "
+              "not read, so this run behaves as if it were absent.", file=sys.stderr)
+        return {}
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+# --- the per-session recall file ---------------------------------------------
+#
+# `~/.semanticly/checkpoints/<session_id>.injected.json` records what
+# `recall --session` has handed one session.
+#
+#     {"repo": "org/slug", "level": "write", "standing": [sha], "fact_ids": [sha]}
+#
+# `standing` holds the standing layer's ids and `fact_ids` the tail of every
+# other line's id, oldest first. Each id is a line's `sha`. `level` is the level
+# the last recall answered, and the capture gate reads it.
+#
+# Losing the file costs a repeated injection, never a failure.
+
+
+def injected_path(session_id: str) -> Path:
+    safe = urllib.parse.quote(session_id, safe="")
+    return config_home() / "checkpoints" / f"{safe}.injected.json"
+
+
+def empty_injected() -> dict:
+    return {"repo": "", "level": "", "standing": [], "fact_ids": []}
+
+
+def read_injected(path: Path) -> dict:
+    """What one session has been handed, or an empty record. Never raises.
+
+    A file with no `standing` list has the older shape, whose ids are not
+    shas, so it reads as empty.
+    """
+
+    parsed = read_state_file(path)
+    held, tail, level = parsed.get("standing"), parsed.get("fact_ids"), parsed.get("level")
+    if not isinstance(held, list):
+        return empty_injected()
+    return {
+        "repo": str(parsed.get("repo") or ""),
+        "level": level if isinstance(level, str) else "",
+        "standing": [str(x) for x in held],
+        "fact_ids": [str(x) for x in tail] if isinstance(tail, list) else [],
+    }
+
+
+def write_injected(path: Path, record: dict) -> None:
+    """Write `record` by temp file and rename.
+
+    A failed write is said rather than raised. It costs a repeated injection
+    on the next turn, which is what losing this file always costs.
+    """
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:
+        print(f"semanticly: could not record what this session was handed "
+              f"({exc.strerror or exc}); the next recall may repeat it.",
+              file=sys.stderr)
+
+
+def recall_lines(body: dict) -> list[dict]:
+    """The `lines` of a recall answer that are objects."""
+
+    lines = body.get("lines")
+    return [row for row in lines if isinstance(row, dict)] if isinstance(lines, list) else []
+
+
+def unique(ids: list[str]) -> list[str]:
+    """`ids` without blanks or repeats, each kept at its newest place."""
+
+    seen: set[str] = set()
+    kept: list[str] = []
+    for value in reversed(ids):
+        if value and value not in seen:
+            seen.add(value)
+            kept.append(value)
+    return kept[::-1]
+
+
+def bounded_tail(standing: list[str], tail: list[str]) -> list[str]:
+    """The newest of `tail` that fit beside `standing`, and any drop said on stderr.
+
+    Standing ids never give way. The tail keeps MAX_SESSION_EXCLUSIONS less the
+    standing count, floored at zero. Its oldest go first, because they were
+    injected furthest back.
+    """
+
+    room = max(MAX_SESSION_EXCLUSIONS - len(standing), 0)
+    if len(tail) <= room:
+        return tail
+    print(f"semanticly: this session holds more than {MAX_SESSION_EXCLUSIONS} facts, so "
+          f"the {len(tail) - room} oldest left its exclusion list and can be recalled "
+          "into it again.", file=sys.stderr)
+    return tail[len(tail) - room:]
+
+
+def session_exclusions(state: dict, repo: str, standing: bool) -> list[str]:
+    """The `exclude_facts` one recall sends, standing ids first and the tail after.
+
+    A `--standing` call sends none, because it starts the session's record
+    over. Ids recorded against another repo match nothing there and are not
+    sent. When the standing ids alone pass SERVER_MAX_EXCLUSIONS, only the
+    newest of them go, and the cut is said once on stderr.
+    """
+
+    if standing or state["repo"] != repo:
+        return []
+    held = state["standing"]
+    if len(held) > SERVER_MAX_EXCLUSIONS:
+        print(f"semanticly: this session holds {len(held)} standing facts, so only the "
+              f"newest {SERVER_MAX_EXCLUSIONS} are excluded and the rest can be recalled "
+              "into it again.", file=sys.stderr)
+        return held[-SERVER_MAX_EXCLUSIONS:]
+    return held + bounded_tail(held, state["fact_ids"])
+
+
+def record_recall(path: Path, repo: str, stored: dict, body: dict, standing: bool) -> None:
+    """Record one recall's line ids and level in the session file.
+
+    `stored` is the session state `cmd_recall` read before the call, so the
+    file is read once per run.
+
+    A line labelled `standing` joins the standing ids, and every other line
+    joins the tail. A `--standing` call, or a call on another repo, replaces
+    the file. Any other call keeps the stored standing ids and appends to the
+    tail.
+    """
+
+    lines = [row for row in recall_lines(body) if row.get("sha")]
+    if standing or stored["repo"] != repo:
+        stored = empty_injected()
+    held = unique(stored["standing"] + [str(row["sha"]) for row in lines
+                                        if row.get("label") == "standing"])
+    tail = unique(stored["fact_ids"] + [str(row["sha"]) for row in lines
+                                        if row.get("label") != "standing"])
+    tail = [sha for sha in tail if sha not in set(held)]
+    level = body.get("level")
+    write_injected(path, {
+        "repo": repo,
+        "level": level if isinstance(level, str) else "",
+        "standing": held,
+        "fact_ids": bounded_tail(held, tail),
+    })
+
+
+# --- relative time ----------------------------------------------------------
+
+def ago_full(when: datetime, now: datetime) -> str:
+    """An age as the console prints it, `now`, `5m ago`, `3h ago`, `6d ago`, `4w ago`.
+
+    Under a minute reads `now` with no suffix. Days run to 27, and 28 days
+    reads `4w`. A moment ahead of `now` counts as zero seconds.
+    """
+
+    seconds = max(0, int((now - when).total_seconds()))
+    if seconds < 60:
+        return "now"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    if seconds < 86400 * 28:
+        return f"{seconds // 86400}d ago"
+    return f"{seconds // (86400 * 7)}w ago"
+
+
+# --- subcommands -------------------------------------------------------------
+
+
+def cmd_whoami(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    cfg.token = token_for(cfg, None)
+    _, body = api(cfg, "GET", "/whoami")
+    if args.json:
+        print(json.dumps(body, indent=2, sort_keys=True))
+        return 0
+    body = body if isinstance(body, dict) else {}
+    print(f"org    {body.get('org') or '—'}")
+    print(f"token  {body.get('token') or '—'}")
+    print(f"agent  {body.get('agent') or '—'}")
+    scopes = body.get("scopes") or []
+    print("scopes " + (" ".join(str(s) for s in scopes) if scopes else "—"))
+    return 0
+
+
+def cmd_recall(args: argparse.Namespace) -> int:
+    """One `recall` tool call. `--session` makes it incremental.
+
+    The session file supplies the exclusions before the call and records the
+    answer after it, and `print_recall` decides what reaches stdout. Under
+    `--json` a refusal prints its envelope on stdout too, so a hook reads one
+    JSON document whatever the answer.
+    """
+
+    cfg = load_config()
+    repo = resolve_repo(args)
+    cfg.token = token_for(cfg, repo)
+    session = (args.session or "").strip()
+    path = injected_path(session) if session else None
+    state = read_injected(path) if path else empty_injected()
+    exclusions = session_exclusions(state, repo, args.standing) if path else []
+    try:
+        text, body = mcp_call(cfg, repo, "recall",
+                              recall_arguments(args, repo, session, exclusions), args.surface)
+    except ApiError as exc:
+        if args.json:
+            print_refusal(exc)
+        raise
+    if path:
+        record_recall(path, repo, state, body, args.standing)
+    print_recall(body, text, session=bool(session), standing=args.standing, as_json=args.json)
+    return 0
+
+
+def recall_arguments(args: argparse.Namespace, repo: str, session: str,
+                     exclusions: list[str]) -> dict:
+    """The `recall` tool's arguments, from the flags.
+
+    `standing` always goes. Each run opens a fresh MCP session, and an unset
+    `standing` is true on a session's first call, so leaving it out would send
+    the standing layer on every run.
+    """
+
+    optional = {
+        "query": " ".join(args.query).strip(),
+        "ref": args.ref,
+        "token_budget": args.token_budget,
+        "session_ref": session,
+        "exclude_facts": exclusions,
+    }
+    return {"repo": repo, "standing": args.standing,
+            **{key: value for key, value in optional.items() if value}}
+
+
+def print_recall(body: dict, text: str, *, session: bool, standing: bool,
+                 as_json: bool) -> None:
+    """Print one recall's answer.
+
+    `--json` echoes the structured body. Outside a session the text prints.
+    Inside one, a per-turn block prints only when a line from the term or
+    semantic layer is new to the session, and a `--standing` block prints when
+    it holds any line. A block saying nothing new would spend context on every
+    turn.
+    """
+
+    if as_json:
+        print(json.dumps(body, indent=2, sort_keys=True))
+        return
+    lines = recall_lines(body)
+    if session and not (lines if standing else
+                        any(row.get("layer") in NEW_LAYERS for row in lines)):
+        return
+    if text:
+        print(text)
+
+
+def print_refusal(exc: ApiError) -> None:
+    """Print a refusal's `/v1` envelope as JSON, the `--json` caller's answer."""
+
+    print(json.dumps(exc.envelope(), indent=2, sort_keys=True))
+
+
+def cmd_remember(args: argparse.Namespace) -> int:
+    """One `remember` tool call carrying one statement.
+
+    A write never falls back to the unscoped token, so a repository with no
+    token of its own refuses here and sends nothing.
+    """
+
+    cfg = load_config()
+    repo = resolve_repo(args)
+    cfg.token = token_for(cfg, repo, write=True)
+    statement = statement_from(args)
+    text, body = mcp_call(cfg, repo, "remember",
+                          remember_arguments(args, repo, statement), args.surface)
+    print_remember(body, text, as_json=args.json)
+    return 0
+
+
+def print_remember(body: dict, text: str, *, as_json: bool) -> None:
+    """Print one remember's answer. `--json` echoes the structured body."""
+
+    if as_json:
+        print(json.dumps(body, indent=2, sort_keys=True))
+    elif text:
+        print(text)
+
+
+def statement_from(args: argparse.Namespace) -> str:
+    """The statement from the arguments, else stdin, or a refusal when blank."""
+
+    statement = " ".join(args.body).strip() if args.body else sys.stdin.read().strip()
+    if not statement:
+        raise CliError("Nothing to remember. Pass the fact as an argument or on stdin.")
+    return statement
+
+
+def remember_arguments(args: argparse.Namespace, repo: str, statement: str) -> dict:
+    """The `remember` tool's arguments, from the flags.
+
+    `facts` holds one statement object with a `body` and nothing else. The
+    server derives every other per-statement field. `confidence` goes only
+    when stated, so an unstated one is the server's to default.
+    """
+
+    optional = {
+        "topics": args.topic or [],
+        "session_ref": (args.session or "").strip(),
+        "confidence": args.confidence,
+    }
+    return {"repo": repo, "facts": [{"body": statement}],
+            **{key: value for key, value in optional.items() if value not in ([], "", None)}}
+
+
+def cmd_ingest(args: argparse.Namespace) -> int:
+    """One ingest arm, picked by its flag and `--kind`."""
+
+    cfg = load_config()
+    repo = resolve_repo(args)
+    session_id = checked_ingest_flags(args)
+    if args.kind == "document":
+        return ingest_document(cfg, repo, Path(args.file), args.surface, as_json=args.json)
+    if args.sweep:
+        return ingest_sweep(cfg, repo, Path(args.sweep), args.surface, as_json=args.json)
+    if args.transcript:
+        return ingest_transcript(cfg, repo, session_id, Path(args.transcript),
+                                 args.surface, as_json=args.json)
+    if args.memory_dir:
+        return ingest_memory(cfg, repo, session_id, Path(args.memory_dir), as_json=args.json)
+    return ingest_file(cfg, repo, session_id, Path(args.file), args.surface,
+                       as_json=args.json)
+
+
+def checked_ingest_flags(args: argparse.Namespace) -> str:
+    """Refuse a flag the chosen arm does not take, and return `--session-id`.
+
+    A document posts a `--file`. A transcript, a memory directory or a
+    prepared slice needs `--session-id`. A sweep takes each session from its
+    file's stem and a document carries none, so either refuses the flag rather
+    than ignore it. A memory directory always posts as MEMORY_SURFACE, so it
+    refuses `--surface`.
+    """
+
+    if args.kind == "document" and not args.file:
+        raise CliError("`--kind document` posts a --file.")
+    if args.memory_dir and args.surface != DEFAULT_SURFACE:
+        raise CliError(f"--memory-dir always posts as `{MEMORY_SURFACE}`, so drop --surface.")
+    session_id = (args.session_id or "").strip()
+    takes_one = (bool(args.transcript) or bool(args.memory_dir)
+                 or (bool(args.file) and args.kind == "session"))
+    if takes_one and not session_id:
+        raise CliError("--transcript, --memory-dir and a --file slice need --session-id.")
+    if session_id and not takes_one:
+        raise CliError("--sweep takes each session from its file's stem and a document "
+                       "carries none, so drop --session-id.")
+    return session_id
+
+
+def ingest_transcript(cfg: Config, repo: str, session_id: str, transcript: Path,
+                      surface: str, *, as_json: bool = False) -> int:
+    """Post what `transcript` holds past the server's cursor.
+
+    The recorded level gates first, so a session below `write` touches no
+    transcript and sends nothing.
+    """
+
+    if not capture_allowed(session_id, repo, "its transcript"):
+        return 0
+    cfg.token = token_for(cfg, repo, write=True)
+    print_ingest_answer(transcript_tail(cfg, repo, session_id, transcript, surface),
+                        as_json=as_json)
+    return 0
+
+
+def ingest_memory(cfg: Config, repo: str, session_id: str, memory_dir: Path, *,
+                  as_json: bool = False) -> int:
+    """Post every kept entry of Claude Code's memory directory.
+
+    The recorded level gates first. The post reads no cursor, because the
+    server drops the uuids it has already seen under the project's
+    session_ref. With no kept entry nothing is sent.
+    """
+
+    if not capture_allowed(session_id, repo, "the project's memory"):
+        return 0
+    messages = memory_entries(memory_dir)
+    if not messages:
+        return 0
+    cfg.token = token_for(cfg, repo, write=True)
+    arguments = ingest_arguments(repo, memory_session_ref(memory_dir), messages,
+                                 MEMORY_SURFACE)
+    print_ingest_answer(post_slice(cfg, repo, arguments, MEMORY_SURFACE), as_json=as_json)
+    return 0
+
+
+def memory_session_ref(memory_dir: Path) -> str:
+    """`claude-code-memory:<digest>`, one stable ref per project.
+
+    The directory holding `memory_dir` is named for the project's local path,
+    which can carry a username or a client's name. The ref is the SHA-256 of
+    that name, cut to 32 hex characters, so the path stays on the machine.
+    """
+
+    project = memory_dir.resolve().parent.name
+    return MEMORY_REF_PREFIX + hashlib.sha256(project.encode("utf-8")).hexdigest()[:32]
+
+
+def ingest_sweep(cfg: Config, repo: str, directory: Path, surface: str, *,
+                 as_json: bool = False) -> int:
+    """Post each `directory/*.jsonl` past its cursor, the file's stem its session.
+
+    The server's cursor read is the gate. It refuses below `write` and
+    carries no transcript bytes, so no recorded level is consulted. A refusal
+    in SWEEP_STOP_STATUSES or SWEEP_STOP_CODES ends the sweep, because it
+    holds for every file. Any other refusal, or an unreadable transcript,
+    skips that session with one line on stderr, so one bad file never starves
+    the sessions sorted after it. The exit is 1 when any session was skipped.
+    """
+
+    if not directory.is_dir():
+        raise CliError(f"{directory} is not a directory.")
+    transcripts = sorted(directory.glob("*.jsonl"))
+    if not transcripts:
+        return 0
+    cfg.token = token_for(cfg, repo, write=True)
+    skipped = 0
+    for transcript in transcripts:
+        session = transcript.stem
+        try:
+            body = transcript_tail(cfg, repo, session, transcript, surface)
+        except ApiError as exc:
+            if sweep_stops_on(exc):
+                raise
+            skipped += 1
+            print(f"semanticly: session `{session}` was skipped — {exc}", file=sys.stderr)
+            continue
+        except TranscriptError as exc:
+            skipped += 1
+            print(f"semanticly: session `{session}` was skipped — {exc}", file=sys.stderr)
+            continue
+        print_sweep_answer(session, body, as_json=as_json)
+    return EXIT_API if skipped else 0
+
+
+def sweep_stops_on(exc: ApiError) -> bool:
+    """Whether a refusal holds for the whole repository, so a sweep stops."""
+
+    return exc.status in SWEEP_STOP_STATUSES or exc.code in SWEEP_STOP_CODES
+
+
+def transcript_tail(cfg: Config, repo: str, session_id: str, transcript: Path,
+                    surface: str) -> dict:
+    """The answer to posting what `transcript` holds past the server's cursor.
+
+    The file is checked before the cursor read, so a missing transcript costs
+    no call. It is opened only after the read, so a refused read opens
+    nothing. An empty cut posts nothing and answers the cursor.
+    """
+
+    if not transcript.is_file():
+        raise TranscriptError(f"Could not read {transcript}: no such file.")
+    cursor = read_cursor(cfg, repo, session_id, surface)
+    messages = slice_transcript(transcript, cursor)
+    if not messages:
+        return {"cursor": cursor}
+    return post_slice(cfg, repo, ingest_arguments(repo, session_id, messages, surface,
+                                                  after=cursor), surface)
+
+
+def ingest_file(cfg: Config, repo: str, session_id: str, path: Path, surface: str,
+                *, as_json: bool = False) -> int:
+    """Post a prepared wire slice. A person's explicit post is not gated."""
+
+    cfg.token = token_for(cfg, repo, write=True)
+    messages = read_prepared_slice(path)
+    arguments = ingest_arguments(repo, session_id, messages, surface)
+    print_ingest_answer(post_slice(cfg, repo, arguments, surface), as_json=as_json)
+    return 0
+
+
+def ingest_document(cfg: Config, repo: str, path: Path, surface: str, *,
+                    as_json: bool = False) -> int:
+    """Post a whole file as one document. A person's explicit post is not gated."""
+
+    cfg.token = token_for(cfg, repo, write=True)
+    arguments = {"repo": repo, "kind": "document", "slice": read_document(path),
+                 "source_surface": surface}
+    print_ingest_answer(post_slice(cfg, repo, arguments, surface), as_json=as_json)
+    return 0
+
+
+def capture_allowed(session_id: str, repo: str, captured: str) -> bool:
+    """Whether the session's recorded level on `repo` lets it capture.
+
+    The level is the one the session's last recall answered. A level recorded
+    for another repository counts as none. A refusal is said on stderr, naming
+    what is `captured`.
+    """
+
+    state = read_injected(injected_path(session_id))
+    level = state["level"] if state["repo"] == repo else ""
+    if level in CAPTURE_LEVELS:
+        return True
+    held = f"holds `{level}` on" if level else "has no recorded level on"
+    print(f"semanticly: this session {held} `{repo}`, so {captured} is not captured.",
+          file=sys.stderr)
+    return False
+
+
+def read_cursor(cfg: Config, repo: str, session_ref: str, surface: str) -> str | None:
+    """The uuid this session's posts reach, from an `ingest` call with no `slice`."""
+
+    arguments = {"repo": repo, "session_ref": session_ref, "source_surface": surface}
+    _, body = mcp_call(cfg, repo, "ingest", arguments, surface)
+    cursor = body.get("cursor")
+    return cursor if isinstance(cursor, str) and cursor else None
+
+
+def ingest_arguments(repo: str, session_ref: str, messages: list, surface: str,
+                     after: str | None = None) -> dict:
+    """The `ingest` tool's arguments for one session slice. `after` goes when known."""
+
+    arguments = {"repo": repo, "session_ref": session_ref, "slice": messages,
+                 "kind": "session", "source_surface": surface}
+    if after:
+        arguments["after"] = after
+    return arguments
+
+
+def post_slice(cfg: Config, repo: str, arguments: dict, surface: str) -> dict:
+    """One `ingest` post's answer."""
+
+    _, body = mcp_call(cfg, repo, "ingest", arguments, surface)
+    return body
+
+
+def read_prepared_slice(path: Path) -> list:
+    """The JSON list of wire messages a `--file` holds, or a refusal naming the file."""
+
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise CliError(f"Could not read {path}: {exc.strerror or exc}") from exc
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise CliError(f"{path} is not JSON: {exc}") from exc
+    if not isinstance(parsed, list):
+        raise CliError(f"{path} must hold a JSON list of messages.")
+    return parsed
+
+
+def read_document(path: Path) -> str:
+    """The text a document file holds, or a refusal naming the file."""
+
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise CliError(f"Could not read {path}: {exc.strerror or exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise CliError(f"{path} is not UTF-8 text.") from exc
+
+
+# --- the transcript slicer ------------------------------------------------
+#
+# A Claude Code transcript is JSON Lines. A row becomes one wire message
+# `{uuid, role, content: [{type: text, text}]}` when its `type` is `user` or
+# `assistant`, it has a `uuid` the server takes, and its content holds
+# non-blank text. A row the server would refuse is dropped, so one odd row
+# cannot stall a session's capture. Every
+# text block goes verbatim and every other block is dropped. Trimming, joining
+# and dropping empty blocks are the server's flatten.
+
+
+def slice_transcript(path: Path, after: str | None) -> list[dict]:
+    """The wire messages in `path` that follow the message `after` names."""
+
+    return cut_after(read_wire(path), after)
+
+
+def read_wire(path: Path) -> list[dict]:
+    """Every wire message in a transcript, up to the first line that does not parse.
+
+    A line still being written does not parse, so the read stops before it.
+    """
+
+    messages: list[dict] = []
+    try:
+        with open(path, "rb") as handle:
+            for raw in handle:
+                try:
+                    record = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, ValueError):
+                    break
+                message = wire_message(record)
+                if message is not None:
+                    messages.append(message)
+    except OSError as exc:
+        raise TranscriptError(f"Could not read {path}: {exc.strerror or exc}") from exc
+    return messages
+
+
+def wire_message(record: object) -> dict | None:
+    """One transcript row as a wire message, or None when it carries no conversation."""
+
+    if not isinstance(record, dict) or record.get("type") not in TRANSCRIPT_ROLES:
+        return None
+    uuid, message = record.get("uuid"), record.get("message")
+    if not isinstance(uuid, str) or uuid_refused(uuid) or not isinstance(message, dict):
+        return None
+    content = wire_content(message.get("content"))
+    if not any(block["text"].strip() for block in content):
+        return None
+    return {"uuid": uuid, "role": record["type"], "content": content}
+
+
+def uuid_refused(uuid: str) -> bool:
+    """Whether the server refuses `uuid`, as Go's `ingest.UUIDRefused` does.
+
+    It refuses an empty uuid, one over MAX_UUID_CHARS code points, and one
+    holding a C0 control, DEL or a C1 control.
+    """
+
+    return (not uuid or len(uuid) > MAX_UUID_CHARS
+            or any(ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F for ch in uuid))
+
+
+def wire_content(content: object) -> list[dict]:
+    """The text blocks of one message's content. A string is one block."""
+
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    if not isinstance(content, list):
+        return []
+    return [{"type": "text", "text": block["text"]} for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+            and isinstance(block.get("text"), str)]
+
+
+def cut_after(messages: list[dict], after: str | None) -> list[dict]:
+    """The messages after the one `after` names, or all of them.
+
+    A cursor the transcript does not hold keeps every message, and the miss is
+    said on stderr.
+    """
+
+    if after is None:
+        return messages
+    for index, message in enumerate(messages):
+        if message["uuid"] == after:
+            return messages[index + 1:]
+    print(f"semanticly: the cursor `{after}` is not in this transcript, so this run "
+          "posts the whole transcript.", file=sys.stderr)
+    return messages
+
+
+# --- the memory reader ---------------------------------------------------
+#
+# Claude Code's memory directory holds `*.md` files of typed notes. An entry
+# is one frontmatter block, whose unindented `type` key decides its kind, and
+# the body up to the next such block or the end of the file. A file that does
+# not open with one, `MEMORY.md` included, or that cannot be read as UTF-8,
+# is skipped. The directory has no interface promise, so the read is
+# defensive and never refuses.
+
+
+def memory_entries(memory_dir: Path) -> list[dict]:
+    """The wire messages for the kept entries, ordered by relative path then position."""
+
+    try:
+        files = sorted(memory_dir.glob("*.md"), key=lambda path: path.name)
+    except OSError:
+        return []
+    messages = []
+    for path in files:
+        relpath = path.relative_to(memory_dir).as_posix()
+        for kind, entry in memory_file_entries(path):
+            if kind in MEMORY_KEPT_TYPES:
+                messages.append(memory_message(relpath, kind, entry))
+    return messages
+
+
+def memory_message(relpath: str, kind: str, entry: str) -> dict:
+    """One kept entry as an assistant message whose uuid is sha256(relpath + entry)."""
+
+    uuid = hashlib.sha256((relpath + entry).encode("utf-8")).hexdigest()
+    return {"uuid": uuid, "role": "assistant",
+            "content": [{"type": "text", "text": f"type: {kind}\n{entry}"}]}
+
+
+def memory_file_entries(path: Path) -> list[tuple[str, str]]:
+    """Each entry in one memory file as `(type, entry text)`, or none when it is skipped."""
+
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    except (OSError, UnicodeDecodeError):
+        return []
+    starts = []
+    index = 0
+    while index < len(lines):
+        block = frontmatter_at(lines, index)
+        if block is None:
+            index += 1
+            continue
+        starts.append((index, block[0]))
+        index = block[1] + 1
+    if not starts or starts[0][0] != 0:
+        return []
+    # `bounds` is built from `starts`, so the two always have one length.
+    bounds = [start for start, _ in starts[1:]] + [len(lines)]
+    return [(kind, "".join(lines[start:end]).strip())
+            for (start, kind), end in zip(starts, bounds)]  # noqa: B905
+
+
+def frontmatter_at(lines: list[str], index: int) -> tuple[str, int] | None:
+    """The `type` and closing line of a frontmatter block opening at `index`, or None.
+
+    A block is a fence line, one or more key lines, and a closing fence. Blank
+    lines may sit between keys. Without a `type` key it is not an entry's block.
+    """
+
+    if lines[index].strip() != FRONTMATTER_FENCE:
+        return None
+    kind = None
+    for close in range(index + 1, len(lines)):
+        line = lines[close]
+        if line.strip() == FRONTMATTER_FENCE:
+            return (kind, close) if kind else None
+        if not line.strip():
+            continue
+        if not FRONTMATTER_KEY.match(line):
+            return None
+        key, _, value = line.partition(":")
+        if key == "type":
+            kind = value.strip().strip("\"'")
+    return None
+
+
+def print_ingest_answer(body: dict, *, as_json: bool) -> None:
+    """Print one ingest answer.
+
+    `--json` prints the body verbatim. Otherwise the headline prints, and
+    every answer but an accepted batch adds the server's note when it has one.
+    """
+
+    if as_json:
+        print(json.dumps(body, indent=2, sort_keys=True))
+        return
+    print(ingest_headline(body))
+    note = str(body.get("note") or "")
+    if note and not accepted_batch(body):
+        print(note)
+
+
+def ingest_headline(body: dict) -> str:
+    """The first line of one ingest answer.
+
+    A document names its confirm link, an accepted batch how far it reaches,
+    a refused one its reason, any other status its batch, and an answer with
+    only a cursor the cursor.
+    """
+
+    status = str(body.get("status") or "")
+    if body.get("confirm_url"):
+        return f"confirm at {body['confirm_url']} (import {body.get('import') or '—'})"
+    if accepted_batch(body):
+        return (f"accepted through {body.get('accepted_through') or '—'} "
+                f"(batch {body.get('id') or '—'})")
+    if status == "refused":
+        return f"refused: {body.get('refused_reason') or '—'}"
+    if status:
+        return f"{status}: batch {body.get('id') or '—'}"
+    cursor = body.get("cursor")
+    return f"nothing new after {cursor}" if cursor else "nothing new"
+
+
+def accepted_batch(body: dict) -> bool:
+    """Whether the answer is a session batch the road took in.
+
+    A document's run shares some status names, so its confirm link rules it out.
+    """
+
+    return not body.get("confirm_url") and body.get("status") in ACCEPTED_STATUSES
+
+
+def print_sweep_answer(session: str, body: dict, *, as_json: bool) -> None:
+    """Print one swept session's answer under its session id.
+
+    `--json` prints one compact object per line, so a sweep's output is JSON Lines.
+    """
+
+    if as_json:
+        print(json.dumps({"session": session, "answer": body}, sort_keys=True))
+        return
+    print(f"session {session}")
+    print_ingest_answer(body, as_json=False)
+
+
+# --- init ---------------------------------------------------------------------
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    """Bind from a terminal, and only read anywhere else."""
+
+    cfg = load_config()
+    if in_terminal():
+        return init_interactive(cfg, args)
+    return init_read_only(cfg, args)
+
+
+def in_terminal() -> bool:
+    """A TTY on stdin and stdout with no SEMANTICLY_TOKEN set.
+
+    The exchange takes only `login`'s unscoped token, so a run under
+    SEMANTICLY_TOKEN reads and never binds.
+    """
+
+    if os.environ.get("SEMANTICLY_TOKEN", "").strip():
+        return False
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def init_interactive(cfg: Config, args: argparse.Namespace) -> int:
+    """Pick a repository and one of its branches, then bind both connections.
+
+    `.semanticly` is written once the repository is picked. The repository's
+    token is minted only when the keychain holds none, and every call after
+    the listing goes under it.
+    """
+
+    cfg.token = token_for(cfg, None)
+    repo = choose_repo(writable_repos(cfg), (args.repo or "").strip())
+    write_semanticly(repo)
+    cfg.token = keychain_get(repo, origin=cfg.api_url) or mint_repo_token(cfg, repo)
+    branches = list_branches(cfg, repo)
+    print_branch_list(branches, now=datetime.now(UTC))
+    print_create_hint(cfg, repo)
+    if not branches:
+        return 0
+    branch = branches[read_choice("Branch", len(branches))]["name"]
+    bind_both(cfg, repo, branch)
+    print(f"Bound the CLI and Claude Code to {branch} on {repo}.")
+    return 0
+
+
+def init_read_only(cfg: Config, args: argparse.Namespace) -> int:
+    """Print the repositories and the named one's branches. Writes nothing.
+
+    The branch list needs the repository's own token, because this run mints
+    none. Without it the run says where the list can be read.
+    """
+
+    cfg.token = token_for(cfg, None)
+    print_repo_rows(writable_repos(cfg))
+    repo = named_repo(args)
+    if repo is None:
+        return 0
+    token = repo_token(cfg, repo)
+    if token:
+        cfg.token = token
+        print_branch_list(list_branches(cfg, repo), now=datetime.now(UTC))
+    else:
+        print(TERMINAL_SENTENCE)
+    print(f"Bind a connection to a branch at {console_link(cfg, repo, 'connections')}.")
+    return 0
+
+
+def writable_repos(cfg: Config) -> list[dict]:
+    """The `list_repos` rows held at `write` or above, in the tool's order."""
+
+    _, body = mcp_call(cfg, None, "list_repos", {}, DEFAULT_SURFACE)
+    rows = body.get("repos")
+    return [row for row in rows or [] if isinstance(row, dict)
+            and row.get("level") in CAPTURE_LEVELS and isinstance(row.get("repo"), str)]
+
+
+def choose_repo(rows: list[dict], preselected: str) -> str:
+    """The repository `--repo` names among `rows`, or the one the person picks."""
+
+    names = [row["repo"] for row in rows]
+    if preselected:
+        if preselected not in names:
+            raise CliError(f"You hold no write on `{preselected}`, so `init` cannot bind it.")
+        return preselected
+    if not names:
+        raise CliError("You hold write on no repository, so `init` has nothing to bind.")
+    print_repo_rows(rows)
+    return names[read_choice("Repository", len(names))]
+
+
+def print_repo_rows(rows: list[dict]) -> None:
+    """One numbered row per repository, with the level held on it."""
+
+    print("Repositories you can write to")
+    for n, row in enumerate(rows, 1):
+        print(f"  {n}. {row['repo']} · {row['level']}")
+
+
+def read_choice(label: str, count: int) -> int:
+    """The index of the row the person types, from 1 to `count`."""
+
+    return choice_index(prompt_choice(f"{label} [1-{count}]: "), count)
+
+
+def prompt_choice(prompt: str) -> str:
+    """What the person types after `prompt`, stripped."""
+
+    try:
+        return input(prompt).strip()
+    except EOFError as exc:
+        raise CliError("No choice was read, so nothing was bound.") from exc
+
+
+def choice_index(answer: str, count: int) -> int:
+    """`answer` as a row index. Only ASCII digits from 1 to `count` count."""
+
+    if not (answer.isascii() and answer.isdigit()) or not 1 <= int(answer) <= count:
+        raise CliError(f"`{answer}` is not a number from 1 to {count}, so nothing was bound.")
+    return int(answer) - 1
+
+
+def named_repo(args: argparse.Namespace) -> str | None:
+    """The repository `--repo` or `.semanticly` names, or None when neither does."""
+
+    if (args.repo or "").strip() or find_semanticly(project_root()):
+        return resolve_repo(args)
+    return None
+
+
+def repo_token(cfg: Config, repo: str) -> str | None:
+    """SEMANTICLY_TOKEN, else the keychain's token for `repo`. Never the unscoped one."""
+
+    from_env = os.environ.get("SEMANTICLY_TOKEN", "").strip()
+    return token_for(cfg, None) if from_env else keychain_get(repo, origin=cfg.api_url)
+
+
+def write_semanticly(repo: str) -> None:
+    """Write `org/slug` to `.semanticly` at the project root."""
+
+    if not SEMANTICLY_FILE_RULE.fullmatch(repo):
+        raise CliError(f"`{repo}` is not org/slug, so no {SEMANTICLY_FILE} was written.")
+    path = project_root() / SEMANTICLY_FILE
+    try:
+        path.write_text(repo + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise CliError(f"Could not write {path}: {exc.strerror or exc}") from exc
+
+
+def mint_repo_token(cfg: Config, repo: str) -> str:
+    """Mint `repo`'s token through the exchange under the unscoped one, and store it."""
+
+    _, body = send_json(cfg, "POST", cfg.api_url + CLI_TOKEN_PATH, {"repo": repo})
+    token = body.get("token") if isinstance(body, dict) else None
+    if not isinstance(token, str):
+        raise CliError(f"The exchange answered without a token for `{repo}`.")
+    keychain_set(repo, token, origin=cfg.api_url)
+    return token
+
+
+def list_branches(cfg: Config, repo: str) -> list[dict]:
+    """`GET /v1/repos/{org}/{repo}/branches`, in the order the route answered."""
+
+    _, body = api(cfg, "GET", nested_repo_path(repo, "/branches"))
+    rows = body.get("branches") if isinstance(body, dict) else None
+    return [row for row in rows or [] if isinstance(row, dict) and isinstance(row.get("name"), str)]
+
+
+def print_branch_list(rows: list[dict], *, now: datetime) -> None:
+    """GUIDANCE, then one numbered row per branch with its mono line."""
+
+    print(GUIDANCE)
+    for n, row in enumerate(rows, 1):
+        print(f"  {n}. {row['name']}")
+        print(f"     {mono_line(row, now)}")
+
+
+def mono_line(row: dict, now: datetime) -> str:
+    """The sharing count, the last write and `bound`, joined by ` · `."""
+
+    parts = [sharing_phrase(row.get("bound_connections")),
+             last_write_phrase(row.get("last_write_at"), now)]
+    if row.get("bound") is True:
+        parts.append("bound")
+    return " · ".join(part for part in parts if part)
+
+
+def sharing_phrase(value: object) -> str:
+    """The sharing clause for `bound_connections`, or nothing for a non-number.
+
+    A count that does not parse prints nothing, as `last_write_phrase` does,
+    because a guessed count would state connections the route did not report.
+    """
+
+    try:
+        count = int(value or 0)
+    except (TypeError, ValueError):
+        return ""
+    if count > 1:
+        return f"shared by {count} connections"
+    if count == 1:
+        return "shared by 1 connection"
+    return "no connections"
+
+
+def last_write_phrase(value: object, now: datetime) -> str:
+    """`last write <when>`, or `no writes yet` for a null.
+
+    A value that does not parse prints nothing, because a guessed time would
+    state a write the route did not report.
+    """
+
+    if value is None:
+        return "no writes yet"
+    try:
+        when = datetime.fromisoformat(str(value))
+    except ValueError:
+        return ""
+    if when.tzinfo is None:
+        return ""
+    return f"last write {ago_full(when, now)}"
+
+
+def print_create_hint(cfg: Config, repo: str) -> None:
+    """Where a branch is created when none fits, with a suggested name."""
+
+    url = console_link(cfg, repo, "branches")
+    name = f"`agents/{cfg.username}/claude-code`" if cfg.username else "one"
+    print(f"No branch fits? Create {name} at {url}, then run `semanticly init` again.")
+
+
+def bind_both(cfg: Config, repo: str, branch: str) -> None:
+    """Bind the CLI's connection and the Claude Code connector to `branch`."""
+
+    bind_cli(cfg, repo, branch)
+    api(cfg, "PUT", nested_repo_path(repo, "/client-binding"),
+        {"client_id": CLAUDE_CODE_CLIENT_ID, "branch": branch})
+
+
+def bind_cli(cfg: Config, repo: str, branch: str) -> None:
+    """Bind the CLI's own connection to `branch`."""
+
+    api(cfg, "PUT", nested_repo_path(repo, "/binding"), {"branch": branch})
+
+
+def console_link(cfg: Config, repo: str, page: str) -> str:
+    """A console page of `repo`, or its path alone with no `console_url`."""
+
+    return f"{cfg.console_url}/{repo}/{page}"
+
+
+# --- login --------------------------------------------------------------------
+
+
+def cmd_login(args: argparse.Namespace) -> int:
+    """Sign in through AuthKit, keep the unscoped token, and bind a named repo.
+
+    No keychain refuses before the browser opens, and a bad `.semanticly`
+    refuses before it too.
+    """
+
+    cfg = load_config()
+    if keychain_backend() is None:
+        raise CliError(NO_KEYCHAIN)
+    repo = named_repo(args)
+    answer = exchange(cfg, authkit_sign_in(cfg))
+    store_login(cfg, answer)
+    print_signed_in(cfg)
+    if repo is None:
+        return 0
+    return login_repo(cfg, repo)
+
+
+def authkit_sign_in(cfg: Config) -> str:
+    """AuthKit's PKCE flow over a loopback redirect, ending in the access JWT.
+
+    The JWT lives in memory only. The caller hands it to `exchange` and drops
+    it.
+    """
+
+    meta = discover_authkit(cfg)
+    resource = cfg.api_url + MOUNT_PATH
+    verifier, challenge = pkce_pair()
+    state = secrets.token_urlsafe(32)
+    receiver = LoopbackReceiver()
+    redirect_uri = receiver.redirect_uri
+    try:
+        client_id = register_client(cfg, meta, redirect_uri)
+        url = authorize_url(meta, {
+            "response_type": "code", "client_id": client_id,
+            "redirect_uri": redirect_uri, "code_challenge": challenge,
+            "code_challenge_method": "S256", "state": state, "resource": resource,
+        })
+        open_browser(url)
+        code = receiver.wait(state)
+    finally:
+        receiver.close()
+    return redeem_code(cfg, meta, {
+        "grant_type": "authorization_code", "code": code,
+        "redirect_uri": redirect_uri, "client_id": client_id,
+        "code_verifier": verifier, "resource": resource,
+    })
+
+
+def discover_authkit(cfg: Config) -> dict:
+    """AuthKit's RFC 8414 metadata, found through the mount's RFC 9728 document."""
+
+    try:
+        _, doc = public_json(cfg, "GET", cfg.api_url + RESOURCE_METADATA_PATH)
+    except ApiError as exc:
+        if exc.status == 404:
+            raise CliError(f"{safe_url(cfg.api_url)} serves no MCP mount, so `login` has "
+                           "nothing to sign in to.") from exc
+        raise
+    servers = doc.get("authorization_servers") if isinstance(doc, dict) else None
+    issuer = servers[0] if isinstance(servers, list) and servers else None
+    if not isinstance(issuer, str) or not issuer:
+        raise CliError(f"{safe_url(cfg.api_url)} names no authorization server.")
+    issuer = checked_endpoint(issuer, "authorization server")
+    _, meta = public_json(cfg, "GET", authorization_server_metadata_url(issuer))
+    return checked_authkit_metadata(meta, issuer)
+
+
+def authorization_server_metadata_url(issuer: str) -> str:
+    """RFC 8414's well-known URL, inserted between the host and any path."""
+
+    parts = urllib.parse.urlsplit(issuer.rstrip("/"))
+    path = "/.well-known/oauth-authorization-server" + parts.path
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+
+def checked_authkit_metadata(meta: object, issuer: str) -> dict:
+    """`meta` when it names `issuer`, S256 and every endpoint `login` calls."""
+
+    if not isinstance(meta, dict) or str(meta.get("issuer", "")).rstrip("/") != issuer.rstrip("/"):
+        raise CliError(f"The metadata at {safe_url(issuer)} names a different issuer.")
+    if "S256" not in (meta.get("code_challenge_methods_supported") or []):
+        raise CliError(f"{safe_url(issuer)} does not offer PKCE S256, so `login` stops.")
+    for key in AUTHKIT_ENDPOINTS:
+        value = meta.get(key)
+        if not isinstance(value, str) or not value:
+            raise CliError(f"{safe_url(issuer)} names no `{key}`.")
+        checked_endpoint(value, key)
+    return meta
+
+
+def checked_endpoint(url: str, label: str) -> str:
+    """`url` when it is HTTPS, or HTTP on a loopback host."""
+
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme == "https" or (parts.scheme == "http"
+                                   and is_loopback_host(parts.hostname or "")):
+        return url
+    raise CliError(f"The {label} at {safe_url(url)} is not HTTPS, so `login` stops.")
+
+
+def pkce_pair() -> tuple[str, str]:
+    """A PKCE verifier and its S256 challenge (RFC 7636)."""
+
+    verifier = secrets.token_urlsafe(64)
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return verifier, base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def register_client(cfg: Config, meta: dict, redirect_uri: str) -> str:
+    """Register a public client for this run's loopback redirect (RFC 7591)."""
+
+    _, body = public_json(cfg, "POST", meta["registration_endpoint"], json_body={
+        "client_name": CLI_CLIENT_NAME,
+        "redirect_uris": [redirect_uri],
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    })
+    client_id = body.get("client_id") if isinstance(body, dict) else None
+    if not isinstance(client_id, str) or not client_id:
+        raise CliError("AuthKit registered no client, so `login` stops.")
+    return client_id
+
+
+def authorize_url(meta: dict, params: dict) -> str:
+    endpoint = meta["authorization_endpoint"]
+    joiner = "&" if "?" in endpoint else "?"
+    return endpoint + joiner + urllib.parse.urlencode(params)
+
+
+def open_browser(url: str) -> None:
+    """Open `url` in the browser and print it, for a browser that does not open."""
+
+    print("Opening your browser to sign in. If it does not open, visit:")
+    print(f"  {url}", flush=True)
+    webbrowser.open(url)
+
+
+def redeem_code(cfg: Config, meta: dict, form: dict) -> str:
+    """The access JWT AuthKit's token endpoint answers for the code."""
+
+    try:
+        _, body = public_json(cfg, "POST", meta["token_endpoint"], form=form)
+    except ApiError as exc:
+        reason = exc.payload.get("error") if isinstance(exc.payload, dict) else None
+        raise CliError(f"AuthKit refused the sign-in ({reason or exc.status}).") from exc
+    token = body.get("access_token") if isinstance(body, dict) else None
+    if not isinstance(token, str) or not token:
+        raise CliError("AuthKit answered without an access token.")
+    return token
+
+
+class LoopbackReceiver:
+    """One `GET /callback` on 127.0.0.1, read for its code and checked for `state`.
+
+    The port is ephemeral. Any other path answers 404 and the wait goes on.
+    """
+
+    def __init__(self, timeout: float = LOGIN_TIMEOUT) -> None:
+        self.timeout = timeout
+        self.query: dict[str, str] | None = None
+        receiver = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            timeout = 10
+
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                parts = urllib.parse.urlsplit(self.path)
+                if parts.path != "/callback" or receiver.query is not None:
+                    self.answer(404, "Not found.")
+                    return
+                receiver.query = dict(urllib.parse.parse_qsl(parts.query))
+                self.answer(200, "Semantic.ly received the sign-in. You can close this tab.")
+
+            def answer(self, status: int, text: str) -> None:
+                body = text.encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+
+    @property
+    def redirect_uri(self) -> str:
+        return f"http://127.0.0.1:{self.server.server_address[1]}/callback"
+
+    def wait(self, state: str) -> str:
+        """The callback's code, once its `state` matches. Anything else refuses."""
+
+        deadline = time.monotonic() + self.timeout
+        while self.query is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CliError("The browser sign-in did not finish within five minutes, "
+                               "so nothing was stored.")
+            self.server.timeout = remaining
+            self.server.handle_request()
+        if not secrets.compare_digest(self.query.get("state", ""), state):
+            raise CliError("The sign-in redirect carried a different state, so nothing "
+                           "was stored.")
+        if self.query.get("error"):
+            raise CliError(f"AuthKit refused the sign-in ({self.query['error']}).")
+        code = self.query.get("code", "")
+        if not code:
+            raise CliError("The sign-in redirect carried no code, so nothing was stored.")
+        return code
+
+    def close(self) -> None:
+        self.server.server_close()
+
+
+def exchange(cfg: Config, jwt: str) -> dict:
+    """`POST /mcp/cli-token` under the JWT with an empty body.
+
+    The JWT rides in `cfg.token` for this one call and is cleared after it.
+    """
+
+    cfg.token = jwt
+    try:
+        _, body = send_json(cfg, "POST", cfg.api_url + CLI_TOKEN_PATH)
+    finally:
+        cfg.token = ""
+    if not isinstance(body, dict) or not isinstance(body.get("token"), str):
+        raise CliError("The exchange answered without a token.")
+    return body
+
+
+def store_login(cfg: Config, answer: dict) -> None:
+    """The unscoped token to the keychain, then the three config keys.
+
+    `cfg` takes the token and both console keys, so later calls in this run
+    use them.
+    """
+
+    keychain_set(UNSCOPED, answer["token"], origin=cfg.api_url)
+    console_url = str(answer.get("console_url") or "")
+    username = str(answer.get("username") or "")
+    write_config({"api_url": cfg.api_url, "console_url": console_url, "username": username})
+    cfg.token = answer["token"]
+    cfg.console_url = console_url.rstrip("/")
+    cfg.username = username
+
+
+def login_repo(cfg: Config, repo: str) -> int:
+    """Mint `repo`'s token, offer its branches, and bind the CLI to the choice."""
+
+    cfg.token = mint_repo_token(cfg, repo)
+    try:
+        branches = list_branches(cfg, repo)
+    except ApiError as exc:
+        if exc.code != "insufficient_level":
+            raise
+        print_read_only(repo)
+        return 0
+    branch = choose_branch(cfg, repo, branches)
+    if branch is None:
+        print_nothing_bound(cfg, repo)
+        return 0
+    bind_cli(cfg, repo, branch)
+    print_bound(repo, branch)
+    return 0
+
+
+def print_signed_in(cfg: Config) -> None:
+    print(f"Signed in to {safe_url(cfg.api_url)} as {cfg.username or 'you'}.")
+
+
+def print_read_only(repo: str) -> None:
+    print(f"`{repo}` is read only for you here, so `login` bound nothing.")
+
+
+def print_nothing_bound(cfg: Config, repo: str) -> None:
+    print(f"Nothing was bound. Create or choose a branch at "
+          f"{console_link(cfg, repo, 'branches')}.")
+
+
+def print_bound(repo: str, branch: str) -> None:
+    print(f"Bound the CLI to {branch} on {repo}.")
+
+
+def choose_branch(cfg: Config, repo: str, branches: list[dict]) -> str | None:
+    """The branch the person picks from the list, or None for no branch or Enter."""
+
+    print_branch_list(branches, now=datetime.now(UTC))
+    print_create_hint(cfg, repo)
+    if not branches:
+        return None
+    answer = prompt_choice(f"Branch [1-{len(branches)}, Enter to skip]: ")
+    if not answer:
+        return None
+    return branches[choice_index(answer, len(branches))]["name"]
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    repo = resolve_repo(args)
+    cfg.token = token_for(cfg, repo)
+    facts, ref, branch, stopped = walk_facts(cfg, repo, args.ref, args.topic)
+    if args.json:
+        # The interchange document has no room for a notice, and an importer
+        # would read a part as the whole. A short walk writes nothing.
+        if stopped:
+            print(f"semanticly: {stop_notice(stopped)}", file=sys.stderr)
+            return EXIT_API
+        print(render_interchange(facts))
+    else:
+        # A TAG resolves to a label that is not the branch it reads (`v1.4` over
+        # `main`); a branch or a bare `main` resolves to its own name. That pair
+        # is the only thing that tells a pinned read from a moving one, and the
+        # header's promise turns on it.
+        print(render_claude_md(repo, ref, facts, stopped, pinned=ref != branch))
+    return 0
+
+
+def walk_facts(cfg: Config, repo: str, ref: str, topic: str) -> tuple[list[dict], str, str, str]:
+    """Every page of `GET /v1/repos/{repo}/facts`, in ascending `seq` order.
+
+    The route answers `seq DESC` a page at a time, so the walk collects the
+    pages in the order it is served them and reverses once at the end. Nothing
+    is re-sorted client side: the total order is the server's, and rebuilding
+    it here from the row fields would be a second ordering that could disagree.
+
+    `has_more` with no `next_cursor` is a stop, not a loop — and it is reported
+    rather than swallowed, because a short export that looks whole is the
+    failure this route's `has_more` exists to prevent.
+
+    So is MAX_PAGES. A server that keeps handing back a cursor would otherwise
+    spin here forever, and the export is what unattended hooks run.
+
+    The fourth return value is WHICH of those stopped the walk, not merely that
+    one did. They call for the same action and they are not the same fact: the
+    bound fires with a live cursor still in hand, so saying the server ran dry
+    would misreport why the export is short. A reader who hit the bound can
+    raise it or narrow the export; a reader whose server dropped the cursor
+    has nothing to change.
+    """
+
+    collected: list[dict] = []
+    label, branch, cursor, stopped = ref or "", "", None, ""
+    for _ in range(MAX_PAGES):
+        query = {"ref": ref, "topic": topic, "top_k": LIST_PAGE, "cursor": cursor}
+        _, body = api(cfg, "GET", repo_path(repo, "/facts"), query=query)
+        body = body if isinstance(body, dict) else {}
+        # The ref and branch the page was ACTUALLY read at, not what was asked
+        # for. An empty `--ref` resolves to `main` server side.
+        label = str(body.get("ref") or label or "main")
+        branch = str(body.get("branch") or branch or "main")
+        page = [row for row in (body.get("facts") or []) if isinstance(row, dict)]
+        collected.extend(page)
+        if not body.get("has_more"):
+            break
+        cursor = body.get("next_cursor")
+        if not cursor:
+            stopped = STOPPED_NO_CURSOR
+            break
+    else:
+        # Out of PAGES, not out of cursor — `cursor` still holds a live one.
+        stopped = STOPPED_PAGE_BOUND
+    collected.reverse()
+    return collected, label, branch, stopped
+
+
+def render_interchange(facts: list[dict]) -> str:
+    """The interchange document `export --json` writes."""
+
+    return json.dumps(
+        {"schema": INTERCHANGE_SCHEMA, "facts": [interchange_entry(row) for row in facts]},
+        indent=2, sort_keys=True)
+
+
+def interchange_entry(row: dict) -> dict:
+    """One listing row as the interchange entry the console's import reads.
+
+    A field the row does not state is omitted rather than written as null.
+    `sha` is the whole content hash, the listing's `sha_full`, and never its
+    six-character prefix.
+    """
+
+    entry = {key: row[key] for key in INTERCHANGE_FIELDS if row.get(key) is not None}
+    if row.get("sha_full"):
+        entry["sha"] = row["sha_full"]
+    return entry
+
+
+def stop_notice(stopped: str) -> str:
+    """The sentence that says why a walk stopped short."""
+
+    if stopped == STOPPED_NO_CURSOR:
+        return ("This export stopped early. The listing said there was more and "
+                "handed back no cursor to continue with, so what follows is a part, "
+                "not the whole.")
+    return (f"This export stopped at its own {MAX_PAGES}-page limit with a "
+            "cursor still in hand, so what follows is a part, not the whole. "
+            "Narrow it with --topic, or raise MAX_PAGES.")
+
+
+def render_claude_md(repo: str, ref: str, facts: list[dict], stopped: str,
+                     pinned: bool) -> str:
+    """The markdown an agent reads, rendered here so no markdown enters Go.
+
+    No relative time, no "last sync", no trailing-window count — every one of
+    those makes two runs differ for a reason that is not the data.
+    """
+
+    out = [f"# {repo} — facts at {ref}", ""]
+    if pinned:
+        # Exactly the promise the route earns and no further. A tag pins which
+        # facts were WRITTEN by its instant, not their current status, so a
+        # merge that supersedes one changes what this export renders. "Frozen",
+        # "immutable" and "reproducible forever" would each be a comfortable
+        # sentence rather than a true one.
+        out.append(
+            "Exported from Semantic.ly. Two runs of this export at the same tag, "
+            "with no merge in between, produce identical bytes."
+        )
+    else:
+        out.append(
+            f"Exported from Semantic.ly at `{ref}`, which moves as facts land. "
+            "Export a published tag for a read two runs can agree on."
+        )
+    out.append("")
+    if stopped:
+        out.append(f"> {stop_notice(stopped)}")
+        # The blank line is structural: without it the fact list below folds
+        # into the blockquote and renders as part of the warning.
+        out.append("")
+    if not facts:
+        out.append("No facts at this ref.")
+        return "\n".join(out) + "\n"
+    for row in facts:
+        marks = []
+        sha = row.get("sha")
+        if sha:
+            marks.append(f"fact:{sha}")
+        confidence = row.get("confidence")
+        if confidence is not None and isinstance(confidence, (int, float)):
+            marks.append(f"confidence {confidence:.2f}")
+        topic = str(row.get("topic") or "").strip()
+        head = f"**{topic}** — " if topic else ""
+        body = str(row.get("body") or "").strip()
+        suffix = f"  `{' · '.join(marks)}`" if marks else ""
+        out.append(f"- {head}{body}{suffix}")
+    return "\n".join(out) + "\n"
+
+
+# --- the parser --------------------------------------------------------------
+
+
+def add_repo_flag(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--repo",
+        help="org/slug. Defaults to the nearest .semanticly file, and is never guessed.",
+    )
+
+
+def add_surface_flag(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--surface",
+        default=DEFAULT_SURFACE,
+        help=("The client slug, sent to the mount as clientInfo.name and, on "
+              "ingest, as source_surface."),
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="semanticly",
+        description=(
+            "A thin client for the Semantic.ly agent API. Reads SEMANTICLY_API_URL, "
+            "falling back to ~/.semanticly/config.json. The token comes from "
+            "SEMANTICLY_TOKEN or the OS keychain. The repo comes from --repo or "
+            "the nearest .semanticly file and is never guessed."
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("recall", help="Recall the repo's memory as one block.")
+    add_repo_flag(p)
+    p.add_argument("query", nargs="*", help="The query. Omit to read without one.")
+    p.add_argument("--ref", help="A published tag. Defaults to the current state.")
+    p.add_argument("--token-budget", type=int)
+    p.add_argument("--standing", action="store_true",
+                   help="Add the repo's standing facts, as a session's first recall does.")
+    p.add_argument(
+        "--session",
+        default="",
+        help=("Recall incrementally for this session. Excludes the facts it "
+              "has already been handed, records the ones this call hands it, "
+              "and prints nothing when nothing is new."),
+    )
+    add_surface_flag(p)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_recall)
+
+    p = sub.add_parser("remember", help="Write one fact to the repo's writer branch.")
+    add_repo_flag(p)
+    p.add_argument("body", nargs="*", help="The fact. Read from stdin when omitted.")
+    p.add_argument("--topic", action="append",
+                   help="A topic for the fact. Repeat the flag for more than one.")
+    p.add_argument("--confidence", type=float)
+    p.add_argument("--session", default="", help="The session this fact came from.")
+    add_surface_flag(p)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_remember)
+
+    p = sub.add_parser("ingest", help="Post a transcript slice or a document for extraction.")
+    add_repo_flag(p)
+    p.add_argument("--session-id",
+                   help=("The session, sent as session_ref. --transcript, --memory-dir "
+                         "and a --file slice need it."))
+    source = p.add_mutually_exclusive_group(required=True)
+    source.add_argument("--transcript",
+                        help="A Claude Code transcript. Posts what follows the server's cursor.")
+    source.add_argument("--sweep", metavar="DIR",
+                        help="Post each DIR/*.jsonl as --transcript does, its stem the session.")
+    source.add_argument("--memory-dir", metavar="DIR",
+                        help=("Claude Code's memory directory. Posts its project and "
+                              "feedback entries as claude-code-memory."))
+    source.add_argument("--file", help=("A prepared wire slice as a JSON list of messages, "
+                                        "or with --kind document the whole document."))
+    p.add_argument("--kind", choices=["session", "document"], default="session",
+                   help="What --file holds. A document is confirmed in the console.")
+    add_surface_flag(p)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_ingest)
+
+    p = sub.add_parser(
+        "export",
+        help="Render a repo's facts at one ref.",
+        description=(
+            "Walks GET /v1/repos/{repo}/facts and renders client side. Two runs at "
+            "the same tag with no merge in between produce identical bytes. A merge "
+            "that supersedes a fact writes new rows, and a tag pins writes rather "
+            "than statuses, so it does not promise more than that."
+        ),
+    )
+    add_repo_flag(p)
+    p.add_argument("--ref", default="", help="A published tag. Omit to read the repo's current basis.")
+    p.add_argument("--topic", default="")
+    rendering = p.add_mutually_exclusive_group()
+    rendering.add_argument("--format", choices=["claude-md"], default="claude-md")
+    rendering.add_argument("--json", action="store_true",
+                           help="Write the interchange document the console's import reads.")
+    p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser(
+        "init",
+        help="Pick a repository and a branch, and bind Claude Code to it.",
+        description=(
+            "With a terminal on stdin and stdout, writes .semanticly and binds the "
+            "CLI and the Claude Code connector to a branch. Anywhere else, or under "
+            "SEMANTICLY_TOKEN, prints the same lists and writes nothing."
+        ),
+    )
+    add_repo_flag(p)
+    p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser(
+        "login",
+        help="Sign in through the browser and keep the token in the OS keychain.",
+        description=(
+            "Runs AuthKit's PKCE flow with a loopback redirect and stores the "
+            "unscoped token in the OS keychain. With a repository named by --repo "
+            "or .semanticly, also mints its token and binds the CLI to a branch."
+        ),
+    )
+    add_repo_flag(p)
+    p.set_defaults(func=cmd_login)
+
+    p = sub.add_parser("whoami", help="Show what the token is.")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_whoami)
+
+    return parser
+
+
+def use_utf8_streams() -> None:
+    """Read and write UTF-8 with bare newlines on Windows.
+
+    Its pipes default to a legacy code page, so a fact or a prompt outside
+    that page would fail to print or arrive garbled. Its text streams also
+    end each line with a carriage return, which a hook's shell would keep as
+    part of the value it reads. A stream that cannot be reconfigured is left
+    as it is.
+    """
+
+    if sys.platform != "win32":
+        return
+    for stream, options in ((sys.stdin, {"errors": "strict"}),
+                            (sys.stdout, {"errors": "replace", "newline": "\n"}),
+                            (sys.stderr, {"errors": "replace", "newline": "\n"})):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", **options)
+
+
+def main(argv: list[str] | None = None) -> int:
+    use_utf8_streams()
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except CliError as exc:
+        print(f"semanticly: {exc}", file=sys.stderr)
+        return exc.exit_code
+    except BrokenPipeError:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
