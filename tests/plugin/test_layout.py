@@ -162,6 +162,11 @@ class PluginManifest(unittest.TestCase):
         self.assertEqual(plugins[0]["description"], self.manifest()["description"])
         self.assertFalse((REPO_ROOT / "plugins" / "cowork").exists())
 
+    def test_the_manifest_version_is_the_clis(self):
+        """A release is tagged from the manifest, and the CLI reports its own."""
+
+        self.assertEqual(self.manifest()["version"], load_cli().VERSION)
+
     def test_the_manifest_carries_no_displayName(self):
         self.assertNotIn("displayName", self.manifest())
 

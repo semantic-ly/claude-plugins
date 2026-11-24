@@ -145,3 +145,12 @@ One plugin test runs `claude plugin validate --strict` and is skipped when
 
 `scripts/package.sh` builds the skill zip for Claude.ai into `dist/`, which
 git ignores.
+
+The tests need Python 3.11 or later. The CLI and the hooks themselves run on
+Python 3.9.
+
+CI runs the tests on every pull request. To release, set the new version in
+`plugins/semanticly/.claude-plugin/plugin.json` and in `VERSION` in
+`plugins/semanticly/bin/semanticly`, merge, then push a tag `v<version>`. The
+release workflow publishes `semanticly`, `semanticly-skill.zip` and
+`SHA256SUMS`.
