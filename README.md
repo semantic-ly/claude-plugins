@@ -168,6 +168,7 @@ Python 3.9.
 
 CI runs the tests on every pull request. To release, set the new version in
 `plugins/semanticly/.claude-plugin/plugin.json` and in `VERSION` in
-`plugins/semanticly/bin/semanticly`, merge, then push a tag `v<version>`. The
-release workflow publishes `semanticly`, `semanticly-skill.zip` and
-`SHA256SUMS`.
+`plugins/semanticly/bin/semanticly`, and merge. When a merge to `main` carries
+a version that has no tag yet, the release workflow tags it `v<version>` and
+publishes `semanticly`, `semanticly-skill.zip` and `SHA256SUMS`. A merge that
+leaves the version alone publishes nothing.

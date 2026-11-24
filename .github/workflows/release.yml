@@ -1,37 +1,46 @@
 name: Release
 
-# Pushing a tag `v<version>` publishes a GitHub release with the standalone
-# CLI, the skill zip and their checksums. The tag must name the version in
-# the plugin manifest.
+# Every push to main runs CI. When the version in the plugin manifest has no
+# tag yet, the run then tags that commit `v<version>` and publishes a GitHub
+# release with the standalone CLI, the skill zip and their checksums. A merge
+# that leaves the version alone publishes nothing.
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 jobs:
   version:
-    name: Check the tag
+    name: Check the version
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.read.outputs.tag }}
+      release: ${{ steps.read.outputs.release }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compare the tag with the manifest
-        env:
-          TAG: ${{ github.ref_name }}
+      - name: Read the manifest and look for its tag
+        id: read
         run: |
           version="$(python3 -c 'import json; print(json.load(open("plugins/semanticly/.claude-plugin/plugin.json"))["version"])')"
-          if [ "$TAG" != "v$version" ]; then
-            echo "::error::The tag is $TAG, but plugin.json says version $version, so the tag should be v$version."
-            exit 1
+          tag="v$version"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            release=false
+            echo "::notice::$tag already exists, so this push publishes nothing."
+          else
+            release=true
+            echo "::notice::$tag does not exist yet, so this push publishes it."
           fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
 
   ci:
     name: CI
@@ -40,7 +49,8 @@ jobs:
 
   publish:
     name: Publish the release
-    needs: ci
+    needs: [version, ci]
+    if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -55,12 +65,13 @@ jobs:
         working-directory: dist
         run: sha256sum --check SHA256SUMS
 
-      - name: Create the release
+      - name: Tag the commit and create the release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.version.outputs.tag }}
+          COMMIT: ${{ github.sha }}
         run: |
           gh release create "$TAG" \
             dist/semanticly dist/semanticly-skill.zip dist/SHA256SUMS \
-            --title "$TAG" --generate-notes --verify-tag
+            --target "$COMMIT" --title "$TAG" --generate-notes
